@@ -1,0 +1,62 @@
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# Python environments and generated files
+**/.venv/
+**/venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+dist/
+*.egg-info/
+
+# Flutter and Dart generated files
+**/.dart_tool/
+**/build/
+**/.gradle/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+mobile/android/local.properties
+mobile/**/ephemeral/
+mobile/ios/Flutter/Generated.xcconfig
+mobile/ios/Flutter/flutter_export_environment.sh
+*.iml
+.idea/
+
+# Logs, temporary files, and OS metadata
+*.log
+logs/
+*.tmp
+*.temp
+*.swp
+*~
+*.bak
+*.orig
+*.rej
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Downloaded model caches
+**/.cache/huggingface/
+**/huggingface/hub/
+**/.cache/torch/
+
+# Local Qdrant storage
+qdrant_storage/
+qdrant_data/
+**/qdrant_storage/
+**/qdrant_data/
+
+# Local source corpus and generated extraction/embedding artifacts
+/data/documents/*.pdf
+/data/processed/
+*.npz
