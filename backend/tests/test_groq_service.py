@@ -39,6 +39,170 @@ def test_sends_only_question_and_retrieved_context(mock_post, caplog):
     assert "test-key" not in caplog.text
 
 
+def test_prompt_requires_cited_program_lists_without_claiming_unproven_completeness():
+    prompt = build_prompt(
+        "Quelles sont toutes les filières EMSI ?",
+        "[PASSAGE A] Génie Civil [[REF:A]]",
+    )
+    assert "énumère les intitulés explicitement présents" in prompt
+    assert "Ne présente pas les passages récupérés comme une liste complète" in prompt
+    assert "distingue les filières des options" in prompt
+
+
+@patch.dict(os.environ, {"GROQ_API_KEY": "test-key", "GROQ_MODEL": "openai/gpt-oss-20b"})
+@patch("app.services.groq_service.httpx.post")
+def test_exhaustive_program_context_separates_titles_prerequisites_and_options(mock_post):
+    documents = [
+        {
+            "source": "Brochure-EMSI.pdf",
+            "page": 9,
+            "content": (
+                "INTITULÉ : Architecture des systèmes (AS)\n"
+                "INTITULÉ : Réseaux et sécurité (RS)\n"
+                "PRÉREQUIS : 2 années préparatoires pour AS, RS\n"
+                "CYCLE : 3 années d'ingénieur pour les deux cursus\n"
+                "OPTIONS : Cloud et cybersécurité"
+            ),
+        },
+        {
+            "source": "Brochure-EMSI.pdf",
+            "page": 10,
+            "content": (
+                "INTITULÉ : Génie civil et infrastructures (GCI)\n"
+                "PRÉREQUIS : 2 années préparatoires pour GCI\n"
+                "OPTIONS : Construction durable"
+            ),
+        },
+    ]
+    response = Mock(status_code=200)
+    response.json.return_value = {
+        "choices": [{
+            "message": {
+                "content": (
+                    "- Architecture des systèmes [[REF:A]]\n"
+                    "- Réseaux et sécurité [[REF:A]]\n"
+                    "- Génie civil et infrastructures [[REF:B]]"
+                )
+            },
+            "finish_reason": "stop",
+        }]
+    }
+    mock_post.return_value = response
+
+    answer = generate_answer("Quelles sont toutes les filières du document ?", documents)
+
+    assert "Architecture des systèmes (Brochure-EMSI.pdf, page 9)" in answer
+    assert "Réseaux et sécurité (Brochure-EMSI.pdf, page 9)" in answer
+    assert "Génie civil et infrastructures (Brochure-EMSI.pdf, page 10)" in answer
+    system_prompt = mock_post.call_args.kwargs["json"]["messages"][0]["content"]
+    assert "un intitulé indépendant par puce" in system_prompt
+    assert "ne devient pas une parenthèse ni une liste d'alias du titre voisin" in system_prompt
+    assert "Sépare les noms de programmes des durées, années préparatoires, prérequis et options" in system_prompt
+    assert "INTITULÉ : Architecture des systèmes (AS)\nINTITULÉ : Réseaux et sécurité (RS)" in system_prompt
+    assert "2 années préparatoires pour AS, RS" in system_prompt
+    assert "OPTIONS : Cloud et cybersécurité" in system_prompt
+    assert mock_post.call_args.kwargs["json"]["max_completion_tokens"] == 1024
+
+
+@patch.dict(os.environ, {"GROQ_API_KEY": "test-key", "GROQ_MODEL": "openai/gpt-oss-20b"})
+@patch("app.services.groq_service.httpx.post")
+def test_structured_catalog_repairs_incomplete_duplicate_program_list(mock_post):
+    catalog = (
+        "GÉNIE CIVIL, BÂTIMENTS & TRAVAUX PUBLICS (GC) GÉNIE FINANCIER (GF) "
+        "3 années Cycle d’ingénieur Ingénierie Informatique & Réseaux "
+        "2 ANNÉES PRÉPARATOIRES POUR IIR, IAII, GI, GESI "
+        "2 ANNÉES PRÉPARATOIRES POUR GC 2 ANNÉES PRÉPARATOIRES POUR GF "
+        "3 années Cycle d’ingénieur Ingénierie des Automatismes & Informatique Industrielle "
+        "3 années Cycle d’ingénieur Génie Industriel "
+        "3 années Cycle d’ingénieur Génie Électrique & Systèmes Intelligents "
+        "3 années Cycle d’ingénieur Génie Civil, Bâtiments & Travaux Publics "
+        "3 années Cycle d’ingénieur Génie Financier Option 1 Actuariat et Finance. "
+        "INGÉNIERIE INFORMATIQUE & RÉSEAUX (IIR) "
+        "INGÉNIERIE DES AUTOMATISMES & INFORMATIQUE INDUSTRIELLE (IAII) "
+        "GÉNIE INDUSTRIEL (GI) GÉNIE ÉLECTRIQUE & SYSTÈMES INTELLIGENTS (GESI)"
+    )
+    response = Mock(status_code=200)
+    response.json.return_value = {"choices": [{"message": {
+        "content": (
+            "- Ingénierie Informatique & Réseaux (IIR, IAII, GI, GESI) [[REF:A]]; "
+            "- Génie Industriel [[REF:A]]; - Génie Civil & BTP [[REF:A]]; "
+            "- Génie Civil, Bâtiments & Travaux Publics [[REF:A]]; "
+            "- Génie Financier [[REF:A]]"
+        )
+    }, "finish_reason": "stop"}]}
+    mock_post.return_value = response
+    documents = [{
+        "source": "Brochure-EMSI.pdf", "page": 9,
+        "content": catalog, "chunk_index": 0,
+    }]
+
+    answer = generate_answer("Quelles sont toutes les filières proposées par l'EMSI ?", documents)
+
+    expected = (
+        "Ingénierie Informatique & Réseaux",
+        "Ingénierie des Automatismes & Informatique Industrielle",
+        "Génie Industriel",
+        "Génie Électrique & Systèmes Intelligents",
+        "Génie Civil, Bâtiments & Travaux Publics",
+        "Génie Financier",
+    )
+    for title in expected:
+        assert title in answer
+    assert answer.count("Génie Civil") == 1
+    assert all(acronym in answer for acronym in ("IIR", "IAII", "GI", "GESI", "GC", "GF"))
+    assert answer.count("Brochure-EMSI.pdf, page 9") >= len(expected)
+
+
+@patch.dict(os.environ, {"GROQ_API_KEY": "test-key", "GROQ_MODEL": "openai/gpt-oss-20b"})
+@patch("app.services.groq_service.httpx.post")
+def test_linked_program_durations_are_added_with_verified_citation(mock_post):
+    response = Mock(status_code=200)
+    response.json.return_value = {"choices": [{"message": {
+        "content": "Je n'ai pas trouvé cette information dans les documents EMSI disponibles."
+    }, "finish_reason": "stop"}]}
+    mock_post.return_value = response
+    documents = [{
+        "source": "Brochure-EMSI.pdf", "page": 9, "chunk_index": 0,
+        "content": (
+            "GÉNIE CIVIL, BÂTIMENTS & TRAVAUX PUBLICS (GC). "
+            "2 années préparatoires pour GC. "
+            "3 années Cycle d’ingénieur Génie Civil, Bâtiments & Travaux Publics."
+        ),
+    }]
+
+    answer = generate_answer(
+        "Quelle est la durée de la formation en Génie Civil ?", documents
+    )
+
+    assert "2 années préparatoires" in answer
+    assert "3 années de cycle ingénieur" in answer
+    assert "5 années au total" in answer
+    assert "Brochure-EMSI.pdf, page 9" in answer
+
+
+@patch.dict(os.environ, {"GROQ_API_KEY": "test-key", "GROQ_MODEL": "openai/gpt-oss-20b"})
+@patch("app.services.groq_service.httpx.post")
+def test_unlinked_program_durations_are_not_added(mock_post):
+    response = Mock(status_code=200)
+    response.json.return_value = {"choices": [{"message": {
+        "content": "Je n'ai pas trouvé cette information dans les documents EMSI disponibles."
+    }, "finish_reason": "stop"}]}
+    mock_post.return_value = response
+    documents = [{
+        "source": "Brochure-EMSI.pdf", "page": 9,
+        "content": (
+            "2 années préparatoires pour IIR. "
+            "3 années Cycle d’ingénieur Génie Civil, Bâtiments & Travaux Publics (GC)."
+        ),
+    }]
+
+    answer = generate_answer(
+        "Quelle est la durée de la formation en Génie Civil ?", documents
+    )
+
+    assert answer == "Je n'ai pas trouvé cette information dans les documents EMSI disponibles."
+
+
 @pytest.mark.parametrize("status,expected", [(401, "Authentification"), (429, "Quota")])
 @patch.dict(os.environ, {"GROQ_API_KEY": "test-key", "GROQ_MODEL": "mock-model"})
 @patch("app.services.groq_service.httpx.post")

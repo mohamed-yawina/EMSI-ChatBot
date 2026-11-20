@@ -96,6 +96,167 @@ def test_api_chat_uses_retrieved_documents_and_groq(monkeypatch):
     assert "[PASSAGE A]" in context and "[PASSAGE B]" in context
 
 
+def test_exhaustive_program_question_retrieves_and_sends_both_curriculum_chunks(monkeypatch):
+    client = setup_test(monkeypatch)
+    curriculum_chunks = [
+        {
+            "source": "Brochure-EMSI.pdf", "page": 9, "score": 0.76,
+            "content": (
+                "Diplôme d’ingénieur. Génie Civil, Bâtiments & Travaux Publics (GC). "
+                "Génie Financier (GF). 3 années Cycle d’ingénieur Ingénierie Informatique & Réseaux "
+                "2 années préparatoires pour IIR, IAII, GI, GESI. "
+                "2 années préparatoires pour GC. 2 années préparatoires pour GF. "
+                "3 années Cycle d’ingénieur Ingénierie des Automatismes & Informatique Industrielle "
+                "3 années Cycle d’ingénieur Génie Industriel "
+                "3 années Cycle d’ingénieur Génie Électrique & Systèmes Intelligents "
+                "3 années Cycle d’ingénieur Génie Civil, Bâtiments & Travaux Publics "
+                "3 années Cycle d’ingénieur Génie Financier."
+            ),
+        },
+        {
+            "source": "Brochure-EMSI.pdf", "page": 9, "score": 0.72,
+            "content": (
+                "2 années préparatoires pour IIR, IAII, GI, GESI. "
+                "Options en cybersécurité, développement digital et intelligence artificielle. "
+                "INGÉNIERIE INFORMATIQUE & RÉSEAUX (IIR). "
+                "INGÉNIERIE DES AUTOMATISMES & INFORMATIQUE INDUSTRIELLE (IAII). "
+                "GÉNIE INDUSTRIEL (GI). GÉNIE ÉLECTRIQUE & SYSTÈMES INTELLIGENTS (GESI)."
+            ),
+        },
+    ]
+    isolated_retriever.search_documents_isolated.return_value = curriculum_chunks
+    response_from_groq = Mock(status_code=200)
+    response_from_groq.json.return_value = {
+        "choices": [{
+            "message": {
+                "content": (
+                    "- Ingénierie Informatique & Réseaux (IIR, IAII, GI, GESI) [[REF:A]]; "
+                    "- Génie Industriel [[REF:A]]; - Génie Civil & BTP [[REF:A]]; "
+                    "- Génie Civil, Bâtiments & Travaux Publics [[REF:A]]; "
+                    "- Génie Financier [[REF:A]]"
+                )
+            },
+            "finish_reason": "stop",
+        }]
+    }
+    groq_post = Mock(return_value=response_from_groq)
+    monkeypatch.setattr(groq_service.httpx, "post", groq_post)
+
+    try:
+        response = client.post("/api/chat", json={
+            "question": "Quelles sont les filières proposées par l'EMSI ?",
+            "use_llm": True,
+            "include_images": False,
+        })
+    finally:
+        teardown_test()
+
+    assert response.status_code == 200
+    answer = response.json()["answer"]
+    for program_name in (
+        "Ingénierie Informatique & Réseaux",
+        "Ingénierie des Automatismes & Informatique Industrielle",
+        "Génie Industriel",
+        "Génie Électrique & Systèmes Intelligents",
+        "Génie Civil, Bâtiments & Travaux Publics",
+        "Génie Financier",
+    ):
+        assert program_name in answer
+    assert answer.count("Génie Civil") == 1
+    assert all(acronym in answer for acronym in ("IIR", "IAII", "GI", "GESI", "GC", "GF"))
+    assert "Brochure-EMSI.pdf, page 9" in answer
+    isolated_retriever.search_documents_isolated.assert_called_once_with(
+        "Quelles sont les filières proposées par l'EMSI ?", limit=10
+    )
+    context = groq_post.call_args.kwargs["json"]["messages"][0]["content"]
+    assert "Ingénierie Informatique & Réseaux" in context
+    assert "Ingénierie des Automatismes & Informatique Industrielle" in context
+    assert "Génie Financier" in context
+
+
+def test_gc_duration_uses_explicit_preparatory_and_cycle_years(monkeypatch):
+    client = setup_test(monkeypatch)
+    curriculum = {
+        "source": "Brochure-EMSI.pdf", "page": 9, "score": 0.91,
+        "catalog_evidence": True, "chunk_index": 0,
+        "content": (
+            "GÉNIE CIVIL, BÂTIMENTS & TRAVAUX PUBLICS (GC). "
+            "2 années préparatoires pour GC. "
+            "3 années Cycle d’ingénieur Génie Civil, Bâtiments & Travaux Publics."
+        ),
+    }
+    monkeypatch.setattr(
+        isolated_retriever,
+        "search_documents_isolated",
+        Mock(return_value=[curriculum]),
+    )
+    response_from_groq = Mock(status_code=200)
+    response_from_groq.json.return_value = {"choices": [{"message": {
+        "content": "Je n'ai pas trouvé cette information dans les documents EMSI disponibles."
+    }, "finish_reason": "stop"}]}
+    groq_post = Mock(return_value=response_from_groq)
+    monkeypatch.setattr(groq_service.httpx, "post", groq_post)
+
+    try:
+        response = client.post("/api/chat", json={
+            "question": "Quelle est la durée de la formation en Génie Civil ?",
+            "use_llm": True,
+            "include_images": False,
+        })
+    finally:
+        teardown_test()
+
+    assert response.status_code == 200
+    assert "2 années préparatoires" in response.json()["answer"]
+    assert "3 années de cycle ingénieur" in response.json()["answer"]
+    assert "5 années au total" in response.json()["answer"]
+    assert "Brochure-EMSI.pdf, page 9" in response.json()["answer"]
+    assert response.json()["sources"] == [
+        {"source": "Brochure-EMSI.pdf", "page": 9, "score": 0.91}
+    ]
+    context = groq_post.call_args.kwargs["json"]["messages"][0]["content"]
+    assert "2 années préparatoires pour GC" in context
+    assert "3 années Cycle d’ingénieur Génie Civil" in context
+
+
+def test_duration_is_not_summed_when_preparatory_years_are_for_another_program(monkeypatch):
+    client = setup_test(monkeypatch)
+    curriculum = {
+        "source": "Brochure-EMSI.pdf", "page": 9, "score": 0.91,
+        "catalog_evidence": True,
+        "content": (
+            "2 années préparatoires pour IIR. "
+            "3 années Cycle d’ingénieur Génie Civil, Bâtiments & Travaux Publics (GC)."
+        ),
+    }
+    monkeypatch.setattr(
+        isolated_retriever,
+        "search_documents_isolated",
+        Mock(return_value=[curriculum]),
+    )
+    response_from_groq = Mock(status_code=200)
+    response_from_groq.json.return_value = {"choices": [{"message": {
+        "content": "Je n'ai pas trouvé cette information dans les documents EMSI disponibles."
+    }, "finish_reason": "stop"}]}
+    groq_post = Mock(return_value=response_from_groq)
+    monkeypatch.setattr(groq_service.httpx, "post", groq_post)
+
+    try:
+        response = client.post("/api/chat", json={
+            "question": "Quelle est la durée de la formation en Génie Civil ?",
+            "use_llm": True,
+            "include_images": False,
+        })
+    finally:
+        teardown_test()
+
+    assert response.status_code == 200
+    assert response.json()["answer"] == (
+        "Je n'ai pas trouvé cette information dans les documents EMSI disponibles."
+    )
+    assert response.json()["sources"] == []
+
+
 def test_campus_list_enumerates_source_names_and_separates_total_with_cache(monkeypatch):
     client = setup_test(monkeypatch)
     documents = [
@@ -585,7 +746,7 @@ def test_general_emsi_trainings_still_use_groq_after_campus_topic_change(monkeyp
     assert response.json()["sources"] == [
         {"source": "Brochure-EMSI.pdf", "page": 26, "score": 0.94}
     ]
-    search.assert_called_once_with("Quelles formations propose l'EMSI ?", limit=8)
+    search.assert_called_once_with("Quelles formations propose l'EMSI ?", limit=10)
     groq_post.assert_called_once()
 
 
@@ -656,7 +817,7 @@ def test_new_conversation_does_not_reuse_previous_campus_context(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["answer"] == "La brochure présente la formation Génie Civil (Brochure-EMSI.pdf, page 26)."
-    search.assert_called_once_with("Quelles formations y sont proposées ?", limit=8)
+    search.assert_called_once_with("Quelles formations y sont proposées ?", limit=10)
     groq_post.assert_called_once()
 
 
@@ -748,3 +909,106 @@ def test_low_relevance_context_returns_exact_out_of_scope_message(monkeypatch):
     assert response.json()["answer"] == "Je n'ai pas trouvé cette information dans les documents EMSI disponibles."
     assert response.json()["sources"] == []
     groq_post.assert_not_called()
+
+
+def test_admission_question_returns_helpful_utf8_answer_when_not_in_brochure(monkeypatch):
+    client = setup_test(monkeypatch)
+    monkeypatch.setattr(
+        isolated_retriever,
+        "search_documents_isolated",
+        Mock(return_value=[]),
+    )
+    groq_post = Mock()
+    monkeypatch.setattr(groq_service.httpx, "post", groq_post)
+    try:
+        response = client.post("/api/chat", json={
+            "question": "Quelles sont les conditions d'admission à l'EMSI ?",
+            "use_llm": True,
+            "include_images": False,
+        })
+    finally:
+        teardown_test()
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    answer = response.content.decode("utf-8")
+    assert "conditions d'admission" in answer
+    assert "diplômes requis" in answer
+    assert "modalités de sélection" in answer
+    assert "documents à fournir" in answer
+    assert response.json()["sources"] == []
+    assert response.json()["images"] == []
+    groq_post.assert_not_called()
+
+
+def test_admission_testimonial_does_not_trigger_a_general_admissions_claim(monkeypatch):
+    client = setup_test(monkeypatch)
+    monkeypatch.setattr(
+        isolated_retriever,
+        "search_documents_isolated",
+        Mock(return_value=[{
+            "source": "Brochure-EMSI.pdf",
+            "page": 26,
+            "score": 0.9,
+            "content": "J'ai rejoint l'EMSI par admission directe et j'ai choisi MIAGE.",
+        }]),
+    )
+    groq_post = Mock()
+    monkeypatch.setattr(groq_service.httpx, "post", groq_post)
+    try:
+        response = client.post("/api/chat", json={
+            "question": "Quelles sont les conditions d'admission à l'EMSI ?",
+            "use_llm": True,
+            "include_images": False,
+        })
+    finally:
+        teardown_test()
+
+    assert response.status_code == 200
+    assert "conditions d'admission" in response.json()["answer"]
+    assert response.json()["sources"] == []
+    groq_post.assert_not_called()
+
+
+def test_explicit_admission_criterion_is_sent_to_groq_and_cited(monkeypatch):
+    client = setup_test(monkeypatch)
+    criterion = {
+        "source": "Brochure-EMSI.pdf",
+        "page": 12,
+        "score": 0.91,
+        "content": "Les candidats doivent être titulaires du baccalauréat.",
+    }
+    monkeypatch.setattr(
+        isolated_retriever,
+        "search_documents_isolated",
+        Mock(return_value=[criterion]),
+    )
+    groq_response = Mock(status_code=200)
+    groq_response.json.return_value = {
+        "choices": [{
+            "message": {
+                "content": "Les candidats doivent être titulaires du baccalauréat [[REF:A]]."
+            },
+            "finish_reason": "stop",
+        }]
+    }
+    groq_post = Mock(return_value=groq_response)
+    monkeypatch.setattr(groq_service.httpx, "post", groq_post)
+    try:
+        response = client.post("/api/chat", json={
+            "question": "Quelles sont les conditions d'admission à l'EMSI ?",
+            "use_llm": True,
+            "include_images": False,
+        })
+    finally:
+        teardown_test()
+
+    assert response.status_code == 200
+    assert response.json()["answer"] == (
+        "Les candidats doivent être titulaires du baccalauréat "
+        "(Brochure-EMSI.pdf, page 12)."
+    )
+    assert response.json()["sources"] == [
+        {"source": "Brochure-EMSI.pdf", "page": 12, "score": 0.91}
+    ]
+    groq_post.assert_called_once()

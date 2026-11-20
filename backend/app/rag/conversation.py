@@ -214,7 +214,12 @@ def has_general_offering_information(documents) -> bool:
     )
 
 
-def select_relevant_documents(documents, limit: int = 4) -> list[dict]:
+def select_relevant_documents(
+    documents,
+    limit: int = 4,
+    *,
+    preserve_catalog_evidence: bool = False,
+) -> list[dict]:
     """Discard weak ranking tails while preserving the retriever's original scores."""
     scored = []
     for document in documents:
@@ -228,4 +233,17 @@ def select_relevant_documents(documents, limit: int = 4) -> list[dict]:
 
     best_score = max(score for score, _ in scored)
     threshold = max(MIN_RETRIEVAL_SCORE, best_score * RELATIVE_RETRIEVAL_SCORE)
-    return [document for score, document in scored if score >= threshold][:max(1, limit)]
+    selected_limit = max(1, limit)
+    selected = [document for score, document in scored if score >= threshold][:selected_limit]
+    if preserve_catalog_evidence:
+        catalog_passages = [
+            document for score, document in scored
+            if document.get("catalog_evidence") and score >= MIN_RETRIEVAL_SCORE
+        ]
+        if catalog_passages and not any(item.get("catalog_evidence") for item in selected):
+            if len(selected) >= selected_limit:
+                selected[-1] = catalog_passages[0]
+            else:
+                selected.append(catalog_passages[0])
+        selected.sort(key=lambda document: float(document.get("score", 0.0)), reverse=True)
+    return selected

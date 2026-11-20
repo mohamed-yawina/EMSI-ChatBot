@@ -295,10 +295,24 @@ def release_persistent_model():
 
 def prepare_for_clip() -> bool:
     """Require a cleared BGE cache and the existing safe RAM floor before CLIP."""
-    if not release_persistent_model():
+    release_started = time.perf_counter()
+    released = release_persistent_model()
+    logger.info(
+        "[CLIP_PERF] stage=release_bge seconds=%.3f confirmed=%s",
+        time.perf_counter() - release_started,
+        released,
+    )
+    if not released:
         logger.warning("CLIP désactivé : libération du cache BGE-M3 non confirmée.")
         return False
+    memory_started = time.perf_counter()
     available_ram = _available_ram_mb()
+    logger.info(
+        "[CLIP_PERF] stage=ram_gate seconds=%.3f available_mb=%s threshold_mb=%s",
+        time.perf_counter() - memory_started,
+        available_ram,
+        PERSISTENT_MIN_RAM_MB,
+    )
     if not should_use_persistent(available_ram):
         logger.warning(
             "CLIP différé : RAM disponible=%s Mio; seuil de sécurité=%s Mio.",
@@ -318,6 +332,11 @@ def search_documents_isolated(question: str, limit: int = 3) -> list:
     if not question:
         return []
     limit = max(1, min(limit, 10))
+
+    # CLIP may stay warm in its dedicated process. Reap that process before
+    # BGE-M3 can be imported or loaded, preserving strict model exclusivity.
+    from app.rag.isolated_clip import stop_clip_worker
+    stop_clip_worker()
 
     with _persistent_lock:
         if _persistent_state != "disabled":

@@ -2,6 +2,8 @@ import unittest
 
 from app.rag.ranking_policy import (
     campus_list_bonus,
+    is_exhaustive_program_question,
+    program_catalog_bonus,
     repair_common_mojibake,
     should_apply_program_topic_bonus,
 )
@@ -62,6 +64,66 @@ class ProgramTopicBonusPolicyTests(unittest.TestCase):
         assert campus_list_bonus(question, names_passage) == 0.18
         assert campus_list_bonus(question, total_only_passage) == 0.0
         assert campus_list_bonus("Quelles formations propose l'EMSI ?", names_passage) == 0.0
+
+    def test_exhaustive_program_query_promotes_curriculum_catalog_structure(self):
+        query = "Quelles sont les filières proposées par l'EMSI ?"
+        catalog = (
+            "Diplôme d'ingénieur. Ingénierie Informatique & Réseaux. "
+            "2 années préparatoires pour IIR, IAII, GI, GESI. "
+            "3 années cycle d'ingénieur. Génie Industriel. "
+            "3 années cycle d'ingénieur. Génie Civil."
+        )
+        unrelated = "La vie associative et les activités sportives de l'école."
+
+        assert is_exhaustive_program_question(query)
+        assert program_catalog_bonus(query, catalog) == 0.18
+        assert program_catalog_bonus(query, unrelated) == 0.0
+        assert program_catalog_bonus("Comment fonctionne l'admission ?", catalog) == 0.0
+
+    def test_general_program_list_question_variants_trigger_exhaustive_retrieval(self):
+        for question in (
+            "Quelles sont toutes les filières de l'EMSI ?",
+            "Quelles formations sont proposées ?",
+            "Liste les filières disponibles.",
+            "Quels sont les cursus de l'EMSI ?",
+            "Quelles sont les formations proposees par l'EMSI ?",
+        ):
+            assert is_exhaustive_program_question(question), question
+
+    def test_specific_program_question_variants_do_not_trigger_exhaustive_retrieval(self):
+        for question in (
+            "Quelle est la durée de la filière Génie Civil ?",
+            "Quels sont les débouchés du Génie Industriel ?",
+            "Quels sont les débouchés des formations en Génie Industriel ?",
+            "Quelles sont les conditions d'admission en IIR ?",
+            "Présente-moi la filière Génie Financier.",
+            "Quelle est la duree de la filiere Genie Civil ?",
+        ):
+            assert not is_exhaustive_program_question(question), question
+
+    def test_specific_program_question_does_not_trigger_exhaustive_retrieval(self):
+        assert not is_exhaustive_program_question(
+            "Quelle est la durée de la filière Génie Civil ?"
+        )
+
+    def test_specific_program_duration_gets_targeted_catalog_retrieval(self):
+        from app.rag.ranking_policy import (
+            is_program_duration_question,
+            program_duration_catalog_bonus,
+        )
+
+        question = "Quelle est la durée de la formation en Génie Civil ?"
+        catalog = (
+            "2 années préparatoires pour GC. "
+            "3 années cycle d'ingénieur Génie Civil, Bâtiments & Travaux Publics. "
+            "Options en bâtiment durable."
+        )
+        unrelated = "La brochure décrit les activités étudiantes et sportives."
+
+        assert is_program_duration_question(question)
+        assert not is_exhaustive_program_question(question)
+        assert program_duration_catalog_bonus(question, catalog) == 0.18
+        assert program_duration_catalog_bonus(question, unrelated) == 0.0
 
 
 if __name__ == "__main__":

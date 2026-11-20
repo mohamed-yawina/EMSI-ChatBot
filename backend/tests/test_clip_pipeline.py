@@ -1,4 +1,5 @@
 import json
+import queue
 import sys
 import types
 from pathlib import Path
@@ -105,28 +106,184 @@ def test_image_collection_metadata_references_existing_assets():
 
 def test_clip_worker_is_prepared_on_cpu_and_returns_simulated_images(monkeypatch):
     monkeypatch.setattr(isolated_retriever, "prepare_for_clip", Mock(return_value=True))
-    fake_result = Mock(returncode=0, stdout='{"images":[{"url":"/images/x.jpeg","source":"Brochure-EMSI.pdf","page":7}]}', stderr="")
-    run = Mock(return_value=fake_result)
-    monkeypatch.setattr(isolated_clip.subprocess, "run", run)
+    isolated_clip.stop_clip_worker()
 
-    images = isolated_clip.search_images_isolated("campus", limit=2, mode="campus")
+    class FakeStdout:
+        def __init__(self, responses):
+            self.responses = responses
 
-    assert images == [{"url": "/images/x.jpeg", "source": "Brochure-EMSI.pdf", "page": 7}]
-    isolated_retriever.prepare_for_clip.assert_called_once_with()
-    env = run.call_args.kwargs["env"]
-    assert env["EMSI_AI_DEVICE"] == "cpu"
-    assert env["OMP_NUM_THREADS"] == "2"
-    payload = json.loads(run.call_args.kwargs["input"])
-    assert payload["mode"] == "campus"
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            line = self.responses.get()
+            if line is None:
+                raise StopIteration
+            return line
+
+        def close(self):
+            pass
+
+    class FakeStdin:
+        def __init__(self, process):
+            self.process = process
+
+        def write(self, raw):
+            request = json.loads(raw)
+            self.process.requests.append(request)
+            if request.get("command") == "shutdown":
+                self.process.returncode = 0
+                self.process.responses.put('{"shutdown":true}\n')
+                self.process.responses.put(None)
+            else:
+                self.process.responses.put(
+                    '{"images":[{"url":"/images/x.jpeg","source":"Brochure-EMSI.pdf","page":7}]}\n'
+                )
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        pid = 123
+
+        def __init__(self):
+            self.responses = queue.Queue()
+            self.requests = []
+            self.returncode = None
+            self.stdin = FakeStdin(self)
+            self.stdout = FakeStdout(self.responses)
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                raise isolated_clip.subprocess.TimeoutExpired("clip_worker", timeout)
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            self.responses.put(None)
+
+        def kill(self):
+            self.terminate()
+
+    fake_process = FakeProcess()
+    popen = Mock(return_value=fake_process)
+    monkeypatch.setattr(isolated_clip.subprocess, "Popen", popen)
+
+    try:
+        images = isolated_clip.search_images_isolated("campus", limit=2, mode="campus")
+
+        assert images == [{"url": "/images/x.jpeg", "source": "Brochure-EMSI.pdf", "page": 7}]
+        isolated_retriever.prepare_for_clip.assert_called_once_with()
+        env = popen.call_args.kwargs["env"]
+        assert env["EMSI_AI_DEVICE"] == "cpu"
+        assert env["OMP_NUM_THREADS"] == "2"
+        assert fake_process.requests[0]["mode"] == "campus"
+
+        # A second, different query reuses the same worker process/model host.
+        images = isolated_clip.search_images_isolated("laboratoire", mode="laboratory")
+        assert len(images) == 1
+        assert popen.call_count == 1
+        assert fake_process.requests[1]["question"] == "laboratoire"
+    finally:
+        isolated_clip.stop_clip_worker()
+
+
+def test_clip_model_and_processor_are_loaded_once_per_worker(monkeypatch):
+    fake_processor = Mock(
+        side_effect=lambda **kwargs: {
+            "input_ids": clip_worker.torch.ones(
+                (len(kwargs["text"]), 1), dtype=clip_worker.torch.long
+            )
+        }
+    )
+    fake_model = Mock()
+    fake_model.to.return_value = fake_model
+    fake_model.get_text_features.side_effect = lambda input_ids: clip_worker.torch.ones(
+        (input_ids.shape[0], 512)
+    )
+    processor_loader = Mock(return_value=fake_processor)
+    model_loader = Mock(return_value=fake_model)
+    monkeypatch.setattr(clip_worker, "CLIPProcessor", Mock(from_pretrained=processor_loader))
+    monkeypatch.setattr(clip_worker, "CLIPModel", Mock(from_pretrained=model_loader))
+    monkeypatch.setattr(clip_worker, "_PROCESSOR", None)
+    monkeypatch.setattr(clip_worker, "_MODEL", None)
+
+    first = clip_worker.encode_questions(["campus"], "cpu")
+    second = clip_worker.encode_questions(["laboratoire"], "cpu")
+
+    assert len(first[0]) == 512
+    assert len(second[0]) == 512
+    processor_loader.assert_called_once_with(clip_worker.CLIP_MODEL)
+    model_loader.assert_called_once_with(clip_worker.CLIP_MODEL)
 
 
 def test_clip_is_skipped_when_ram_is_low_or_release_is_unconfirmed(monkeypatch):
     monkeypatch.setattr(isolated_retriever, "prepare_for_clip", Mock(return_value=False))
-    run = Mock()
-    monkeypatch.setattr(isolated_clip.subprocess, "run", run)
+    popen = Mock()
+    monkeypatch.setattr(isolated_clip.subprocess, "Popen", popen)
     with pytest.raises(isolated_clip.ClipSearchDeferred):
         isolated_clip.search_images_isolated("campus")
-    run.assert_not_called()
+    popen.assert_not_called()
+
+
+def test_clip_timeout_stops_worker_and_logs_duration(monkeypatch, caplog):
+    monkeypatch.setattr(isolated_retriever, "prepare_for_clip", Mock(return_value=True))
+    isolated_clip.stop_clip_worker()
+
+    class NoResponseProcess:
+        pid = 456
+
+        def __init__(self):
+            self.lines = queue.Queue()
+            self.stdin = Mock()
+            self.stdout = self
+            self.returncode = None
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            line = self.lines.get()
+            if line is None:
+                raise StopIteration
+            return line
+
+        def close(self):
+            self.lines.put(None)
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                raise isolated_clip.subprocess.TimeoutExpired("clip_worker", timeout)
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            self.lines.put(None)
+
+        def kill(self):
+            self.returncode = -9
+
+    process = NoResponseProcess()
+    monkeypatch.setattr(isolated_clip.subprocess, "Popen", Mock(return_value=process))
+    monkeypatch.setattr(isolated_clip, "CLIP_TIMEOUT", 0.01)
+
+    try:
+        with pytest.raises(RuntimeError, match="recherche CLIP"):
+            isolated_clip.search_images_isolated("campus")
+
+        assert process.returncode == -15
+        assert "worker_request_timeout_seconds=" in caplog.text
+    finally:
+        isolated_clip.stop_clip_worker()
 
 
 def test_prepare_for_clip_requires_confirmed_release_then_ram():
@@ -209,6 +366,30 @@ def test_chat_includes_only_simulated_indexed_images_and_default_is_empty(monkey
         main.get_cached_rag_answer.cache_clear()
 
 
+def test_non_person_image_request_uses_clip_without_discarded_bge_answer(monkeypatch):
+    candidate = {
+        "id": "indexed-campus-image", "url": "/images/campus.jpg",
+        "source": "Brochure-EMSI.pdf", "page": 7, "score": 0.91,
+    }
+    rag = Mock(side_effect=AssertionError("successful image response should not run discarded text RAG"))
+    monkeypatch.setattr(main, "_compute_rag_answer", rag)
+    monkeypatch.setattr(main, "get_cached_images", Mock(return_value=[candidate]))
+    monkeypatch.setattr(
+        "app.rag.image_evidence.image_candidate_decision",
+        lambda image, intent, documents: (True, "same-page excerpt", "mocked valid candidate"),
+    )
+
+    response = TestClient(main.app).post("/api/chat", json={
+        "question": "Montre-moi une photo d'un campus EMSI",
+        "use_llm": True,
+        "include_images": True,
+    })
+
+    assert response.status_code == 200
+    assert response.json()["images"] == [candidate]
+    rag.assert_not_called()
+
+
 def test_ram_deferred_clip_keeps_text_response_and_returns_empty_images(monkeypatch):
     main.get_cached_rag_answer.cache_clear()
     monkeypatch.setattr(isolated_retriever, "search_documents_isolated", Mock(return_value=[{
@@ -281,6 +462,7 @@ def test_targeted_image_requires_visual_contrast_not_page_words_alone(monkeypatc
 
 
 def test_generic_clip_search_scores_confounders_and_can_retain_relevant_candidate(monkeypatch):
+    monkeypatch.setattr(clip_worker, "_QDRANT_CLIENT", None)
     monkeypatch.setattr(
         clip_worker,
         "encode_questions",
@@ -378,7 +560,7 @@ def test_api_rejects_lab_result_when_visual_scores_favor_graduation(monkeypatch)
         "id": "lab-or-graduation", "source": "Brochure-EMSI.pdf", "page": 30,
         "url": "/images/ambiguous.jpg", "score": 0.38, "visual_margin": -0.04,
     }
-    monkeypatch.setattr(main, "_compute_rag_answer", Mock(return_value=("", [], [])))
+    monkeypatch.setattr(main, "_compute_rag_answer", Mock(return_value=("", [])))
     monkeypatch.setattr(main, "get_cached_images", Mock(return_value=[candidate]))
     monkeypatch.setattr(
         "app.rag.image_evidence.page_context",
@@ -505,9 +687,60 @@ def test_image_route_does_not_expose_non_image_processed_files():
 @pytest.mark.parametrize("failure", ["exit", "invalid-json"])
 def test_clip_worker_errors_are_clear(monkeypatch, failure):
     monkeypatch.setattr(isolated_retriever, "prepare_for_clip", Mock(return_value=True))
-    result = Mock(returncode=1 if failure == "exit" else 0,
-                  stdout="not json" if failure == "invalid-json" else "",
-                  stderr="simulated failure")
-    monkeypatch.setattr(isolated_clip.subprocess, "run", Mock(return_value=result))
-    with pytest.raises(RuntimeError):
-        isolated_clip.search_images_isolated("campus")
+    isolated_clip.stop_clip_worker()
+
+    class FakeStdout:
+        def __init__(self, line):
+            self.lines = iter([line])
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self.lines)
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        pid = 789
+
+        def __init__(self):
+            self.stdin = Mock()
+            self.stdout = FakeStdout(
+                "not json\n" if failure == "invalid-json" else '{"error":"clip_search_failed"}\n'
+            )
+            self.returncode = 1 if failure == "exit" else 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(isolated_clip.subprocess, "Popen", Mock(return_value=FakeProcess()))
+    try:
+        with pytest.raises(RuntimeError):
+            isolated_clip.search_images_isolated("campus")
+    finally:
+        isolated_clip.stop_clip_worker()
+
+
+def test_text_retrieval_stops_warm_clip_worker_before_bge(monkeypatch):
+    events = []
+    monkeypatch.setattr(isolated_clip, "stop_clip_worker", lambda: events.append("stop_clip"))
+    monkeypatch.setattr(isolated_retriever, "_persistent_state", "disabled")
+    monkeypatch.setattr(
+        isolated_retriever,
+        "_search_documents_subprocess",
+        lambda question, limit: events.append("search_bge") or [],
+    )
+
+    assert isolated_retriever.search_documents_isolated("campus") == []
+    assert events == ["stop_clip", "search_bge"]

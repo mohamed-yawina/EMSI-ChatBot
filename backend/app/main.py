@@ -157,6 +157,12 @@ def _compute_rag_answer(
     *,
     return_evidence: bool = False,
 ):
+    from app.services.unavailable_answer import (
+        has_explicit_admission_criteria,
+        is_admission_question,
+        unavailable_answer,
+    )
+
     from app.rag.isolated_retriever import (
         search_documents_isolated
     )
@@ -165,12 +171,30 @@ def _compute_rag_answer(
 
     logger.info("Recherche textuelle demandée (question_chars=%d)", len(question))
 
+    from app.rag.ranking_policy import (
+        is_exhaustive_program_question,
+        is_program_duration_question,
+    )
+    from app.rag.conversation import requested_campus_offerings
+    campus_offering_target = requested_campus_offerings(question, history)
+    exhaustive_program_list = (
+        is_exhaustive_program_question(question)
+        and not campus_offering_target
+    )
+    program_duration_query = (
+        is_program_duration_question(question)
+        and not campus_offering_target
+    )
+    preserve_program_catalog = exhaustive_program_list or program_duration_query
+    retrieval_limit = 10 if exhaustive_program_list else 8
+    selected_limit = 8 if preserve_program_catalog else 4
+
     # Récupération de davantage de candidats.
     start_search = time.perf_counter()
 
     documents = search_documents_isolated(
         retrieval_query,
-        limit=8
+        limit=retrieval_limit
     )
 
     search_duration = (
@@ -189,9 +213,34 @@ def _compute_rag_answer(
         requested_campus_offerings,
         select_relevant_documents,
     )
-    selected_documents = select_relevant_documents(documents, limit=4)
-    campus_offering_target = requested_campus_offerings(question, history)
-    if campus_offering_target:
+    selected_documents = select_relevant_documents(
+        documents,
+        limit=selected_limit,
+        preserve_catalog_evidence=preserve_program_catalog,
+    )
+    if exhaustive_program_list:
+        selected_documents.sort(
+            key=lambda document: not document.get("catalog_evidence", False)
+        )
+        logger.info(
+            "[RAG_EXHAUSTIVE] groq_context_candidates=%s",
+            [
+                {"id": document.get("id"), "page": document.get("page"),
+                 "chunk_index": document.get("chunk_index"),
+                 "score": document.get("score"),
+                 "excerpt": str(document.get("content", ""))[:240]}
+                for document in selected_documents
+            ],
+        )
+    if (
+        is_admission_question(question)
+        and not has_explicit_admission_criteria(selected_documents)
+    ):
+        # Keep autobiographical mentions such as "admission directe" and
+        # generic apply calls from being treated as admissions requirements.
+        answer = unavailable_answer(question)
+        source_documents = []
+    elif campus_offering_target:
         # Use only selected passages containing an explicit, same-sentence
         # campus-to-offering relationship. Local offering answers are quoted
         # verbatim so Groq cannot expand a partial local list with general EMSI courses.
@@ -228,7 +277,7 @@ def _compute_rag_answer(
                 )
                 source_documents = cited_offerings
             else:
-                answer = "Je n'ai pas trouvé cette information dans les documents EMSI disponibles."
+                answer = unavailable_answer(question)
                 source_documents = []
         elif has_general_offering_information(selected_documents):
             general_sources = [
@@ -246,9 +295,9 @@ def _compute_rag_answer(
                     f"({document['source']}, page {document['page']})."
                 )
             else:
-                answer = "Je n'ai pas trouvé cette information dans les documents EMSI disponibles."
+                answer = unavailable_answer(question)
         else:
-            answer = "Je n'ai pas trouvé cette information dans les documents EMSI disponibles."
+            answer = unavailable_answer(question)
             source_documents = []
     elif use_llm:
         from app.services.groq_service import (
@@ -291,9 +340,7 @@ def _compute_rag_answer(
                 + passages
             )
         else:
-            answer = (
-                "Je n'ai pas trouvé cette information dans les documents EMSI disponibles."
-            )
+            answer = unavailable_answer(question)
 
     sources = [
         {
@@ -395,13 +442,22 @@ def chat(request: ChatRequest):
     try:
         # 1. Recherche textuelle + génération optionnelle Groq.
         selected_documents = []
-        if request.include_images and image_intent.requested:
-            # Reuse the single text retrieval for both answer and image
-            # evidence. Image retrieval is not allowed to stand alone.
+        image_search_requested = request.include_images and image_intent.requested
+        person_evidence_required = image_search_requested and bool(image_intent.person_target)
+
+        # For non-person image requests, the final response is based on CLIP
+        # candidates plus same-page brochure evidence. The text answer was
+        # discarded unconditionally after image selection, so avoid loading
+        # BGE/Groq on this path. Person identification still requires its
+        # separate, strict text-and-caption evidence check.
+        if person_evidence_required:
+            # Person-image matching requires explicit same-page document evidence.
             answer, sources, selected_documents = _compute_rag_answer(
                 question, request.use_llm, retrieval_query, history,
                 return_evidence=True,
             )
+        elif image_search_requested:
+            answer, sources = "", []
         elif history:
             # Stateful requests bypass the process-wide answer cache.
             answer, sources = _compute_rag_answer(
@@ -478,10 +534,15 @@ def chat(request: ChatRequest):
                 from app.rag.isolated_clip import ClipSearchDeferred
                 if isinstance(exc, ClipSearchDeferred):
                     logger.warning("Recherche CLIP différée : %s", exc)
-                    answer = _image_search_unavailable(answer)
                 else:
                     logger.exception("Recherche CLIP indisponible")
-                    answer = _image_search_unavailable(answer)
+                # Preserve the previous text fallback if image search cannot
+                # run, while keeping successful image-only requests lean.
+                if image_search_requested and not person_evidence_required:
+                    answer, sources = _compute_rag_answer(
+                        question, request.use_llm, retrieval_query, history
+                    )
+                answer = _image_search_unavailable(answer)
             if (
                 image_intent.person_target
                 and not images
@@ -490,6 +551,12 @@ def chat(request: ChatRequest):
                 answer = _person_photo_not_verified()
                 sources = []
             elif not images and not image_search_failed:
+                if image_search_requested and not person_evidence_required:
+                    # Keep the previous text-source fallback when CLIP ran
+                    # successfully but found no image that passed validation.
+                    answer, sources = _compute_rag_answer(
+                        question, request.use_llm, retrieval_query, history
+                    )
                 answer = _no_relevant_image_answer(image_intent.mode)
             elif images:
                 image_sources = []

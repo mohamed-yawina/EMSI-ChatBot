@@ -2,11 +2,27 @@
 import json
 import os
 import sys
+import time
+
+_WORKER_IMPORT_STARTED = time.perf_counter()
 
 import torch
 from qdrant_client import QdrantClient
 from transformers import CLIPModel, CLIPProcessor
 from app.rag.image_utils import build_image_result
+
+
+def _perf(stage, started, **details):
+    """Emit bounded, secret-free worker timings on stderr for parent capture."""
+    record = {
+        "stage": stage,
+        "seconds": round(time.perf_counter() - started, 3),
+        **details,
+    }
+    print("[CLIP_PERF] " + json.dumps(record, ensure_ascii=True), file=sys.stderr, flush=True)
+
+
+_perf("worker_imports", _WORKER_IMPORT_STARTED)
 
 
 # =====================================================
@@ -21,6 +37,9 @@ MAX_CPU_THREADS = 2
 MAX_RESULTS = 10
 MAX_CONTRAST_CANDIDATES = 200
 LAST_DIAGNOSTICS = []
+_PROCESSOR = None
+_MODEL = None
+_QDRANT_CLIENT = None
 
 NEGATIVE_PROMPTS = {
     "generic": (
@@ -60,6 +79,7 @@ def _mode_prompt(question, mode):
 # =====================================================
 
 def encode_questions(questions, device):
+    global _PROCESSOR, _MODEL
     torch.set_num_threads(MAX_CPU_THREADS)
 
     try:
@@ -73,23 +93,21 @@ def encode_questions(questions, device):
         flush=True
     )
 
-    processor = CLIPProcessor.from_pretrained(
-        CLIP_MODEL
-    )
+    if _PROCESSOR is None:
+        processor_started = time.perf_counter()
+        _PROCESSOR = CLIPProcessor.from_pretrained(CLIP_MODEL)
+        _perf("processor_load", processor_started)
+    if _MODEL is None:
+        model_started = time.perf_counter()
+        _MODEL = CLIPModel.from_pretrained(CLIP_MODEL).to(device)
+        _MODEL.eval()
+        _perf("model_load", model_started, device=device)
 
-    model = None
     inputs = None
     features = None
-    vector = None
 
     try:
-        model = CLIPModel.from_pretrained(
-            CLIP_MODEL
-        ).to(device)
-
-        model.eval()
-
-        inputs = processor(
+        inputs = _PROCESSOR(
             text=questions,
             return_tensors="pt",
             padding=True,
@@ -101,8 +119,9 @@ def encode_questions(questions, device):
             for key, value in inputs.items()
         }
 
+        embedding_started = time.perf_counter()
         with torch.inference_mode():
-            features = model.get_text_features(
+            features = _MODEL.get_text_features(
                 **inputs
             )
 
@@ -120,6 +139,7 @@ def encode_questions(questions, device):
 
             features = features.float()
             features = features / features.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+            _perf("text_embeddings", embedding_started, prompts=len(questions), device=device)
             return [row.cpu().tolist() for row in features]
 
     except torch.cuda.OutOfMemoryError as exc:
@@ -129,7 +149,7 @@ def encode_questions(questions, device):
         ) from exc
 
     finally:
-        del features, inputs, model
+        del features, inputs
 
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -140,6 +160,7 @@ def encode_questions(questions, device):
 # =====================================================
 
 def search_images(question, limit=3, mode="generic"):
+    global _QDRANT_CLIENT
     global LAST_DIAGNOSTICS
     LAST_DIAGNOSTICS = []
     question = str(question).strip()
@@ -155,13 +176,16 @@ def search_images(question, limit=3, mode="generic"):
     positive_prompt = _mode_prompt(question, mode)
     negative_prompts = NEGATIVE_PROMPTS.get(mode, ())
     query_prompts = [positive_prompt, *negative_prompts]
+    embedding_started = time.perf_counter()
     query_vectors = encode_questions(query_prompts, device)
+    _perf("encode_questions_total", embedding_started, prompts=len(query_prompts))
 
     # 2. Rechercher les images similaires.
-    client = QdrantClient(
-        url=QDRANT_URL,
-        timeout=20
-    )
+    if _QDRANT_CLIENT is None:
+        qdrant_client_started = time.perf_counter()
+        _QDRANT_CLIENT = QdrantClient(url=QDRANT_URL, timeout=20)
+        _perf("qdrant_client_init", qdrant_client_started)
+    client = _QDRANT_CLIENT
 
     candidate_limit = (
         MAX_CONTRAST_CANDIDATES
@@ -169,17 +193,20 @@ def search_images(question, limit=3, mode="generic"):
         else min(60, max(limit * 8, 20))
     )
 
+    positive_query_started = time.perf_counter()
     results = client.query_points(
         collection_name=IMAGE_COLLECTION,
         query=query_vectors[0],
         limit=candidate_limit,
         with_payload=True
     ).points
+    _perf("qdrant_positive_query", positive_query_started, candidates=len(results))
 
     # Contrastive scores compare the requested visual category with likely
     # confounders. Querying the small image collection does not re-encode or
     # alter its vectors; it only scores existing points.
     negative_scores = {}
+    negative_query_started = time.perf_counter()
     for vector in query_vectors[1:]:
         points = client.query_points(
             collection_name=IMAGE_COLLECTION,
@@ -189,12 +216,15 @@ def search_images(question, limit=3, mode="generic"):
         ).points
         for point in points:
             negative_scores.setdefault(str(point.id), []).append(float(point.score))
+    _perf("qdrant_contrast_queries", negative_query_started,
+          prompts=len(query_vectors) - 1, ids_scored=len(negative_scores))
 
     # 3. Préparer les résultats pour Flutter.
     images = []
     used_urls = set()
     used_pages = set()
     diagnostics = LAST_DIAGNOSTICS
+    filtering_started = time.perf_counter()
 
     for result in results:
         payload = result.payload or {}
@@ -253,6 +283,8 @@ def search_images(question, limit=3, mode="generic"):
         if len(used_pages) >= limit:
             break
 
+    _perf("candidate_filtering", filtering_started,
+          candidates=len(results), retained=len(images), decisions=len(diagnostics))
     return images
 
 
@@ -262,49 +294,35 @@ def search_images(question, limit=3, mode="generic"):
 
 def main():
     try:
-        raw_request = sys.stdin.read()
+        for raw_request in sys.stdin:
+            if not raw_request.strip():
+                continue
+            try:
+                request = json.loads(raw_request)
+                if request.get("command") == "shutdown":
+                    print(json.dumps({"shutdown": True}), flush=True)
+                    return
 
-        request = json.loads(raw_request)
-
-        question = request.get(
-            "question", ""
-        )
-
-        limit = request.get(
-            "limit", 3
-        )
-        mode = request.get("mode", "generic")
-
-        images = search_images(
-            question,
-            limit,
-            mode,
-        )
-
-        if LAST_DIAGNOSTICS:
-            print(
-                "CLIP candidats (score/marge/decision): "
-                + json.dumps(LAST_DIAGNOSTICS[:60], ensure_ascii=False),
-                file=sys.stderr,
-                flush=True,
-            )
-
-        # Important :
-        # stdout doit contenir uniquement du JSON.
-        print(
-            json.dumps(
-                {"images": images},
-                ensure_ascii=False
-            ),
-            flush=True
-        )
-
+                worker_started = time.perf_counter()
+                images = search_images(
+                    request.get("question", ""),
+                    request.get("limit", 3),
+                    request.get("mode", "generic"),
+                )
+                _perf("worker_total", worker_started, retained=len(images))
+                if LAST_DIAGNOSTICS:
+                    print(
+                        "CLIP candidats (score/marge/decision): "
+                        + json.dumps(LAST_DIAGNOSTICS[:60], ensure_ascii=True),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                print(json.dumps({"images": images}, ensure_ascii=False), flush=True)
+            except Exception as exc:
+                print(f"Erreur CLIP : {exc}", file=sys.stderr, flush=True)
+                print(json.dumps({"error": "clip_search_failed"}), flush=True)
     except Exception as exc:
-        print(
-            f"Erreur CLIP : {exc}",
-            file=sys.stderr,
-            flush=True
-        )
+        print(f"Erreur CLIP worker : {exc}", file=sys.stderr, flush=True)
         sys.exit(1)
 
 

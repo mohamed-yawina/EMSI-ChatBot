@@ -12,6 +12,10 @@ import time
 
 from app.rag.ranking_policy import (
     campus_list_bonus,
+    is_exhaustive_program_question,
+    is_program_duration_question,
+    program_catalog_bonus,
+    program_duration_catalog_bonus,
     repair_common_mojibake,
     should_apply_program_topic_bonus,
 )
@@ -436,6 +440,8 @@ def search_documents(
         MAX_CANDIDATES,
         max(limit * 10, 30)
     )
+    exhaustive_program_list = is_exhaustive_program_question(question)
+    program_duration_query = is_program_duration_question(question)
 
     results = client.query_points(
         collection_name=TEXT_COLLECTION,
@@ -443,6 +449,103 @@ def search_documents(
         limit=candidate_limit,
         with_payload=True
     ).points
+
+    supplemental_catalog_points = []
+    supplemental_catalog_ids = set()
+    if exhaustive_program_list:
+        candidate_catalogs = [
+            point for point in results
+            if program_catalog_bonus(
+                question,
+                str((point.payload or {}).get("content", "")),
+                exhaustive=True,
+            ) > 0
+        ]
+        if not candidate_catalogs:
+            # A semantic top-60 can omit a compact summary page even when its
+            # detailed course pages rank highly. For list queries only, inspect
+            # the small existing payload collection and add matching curriculum
+            # structure; this reads no vectors and performs no reindexing.
+            scroll_points, next_offset = client.scroll(
+                collection_name=TEXT_COLLECTION,
+                limit=256,
+                with_payload=True,
+                with_vectors=False,
+            )
+            all_points = list(scroll_points)
+            while next_offset is not None:
+                scroll_points, next_offset = client.scroll(
+                    collection_name=TEXT_COLLECTION,
+                    limit=256,
+                    offset=next_offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if not scroll_points:
+                    break
+                all_points.extend(scroll_points)
+
+            seen_ids = {str(getattr(point, "id", "")) for point in results}
+            supplemental_catalog_points = [
+                point for point in all_points
+                if str(getattr(point, "id", "")) not in seen_ids
+                and program_catalog_bonus(
+                    question,
+                    str((point.payload or {}).get("content", "")),
+                    exhaustive=True,
+                ) > 0
+            ]
+            supplemental_catalog_ids = {
+                str(getattr(point, "id", ""))
+                for point in supplemental_catalog_points
+            }
+            results.extend(supplemental_catalog_points)
+        logger.info(
+            "[RAG_EXHAUSTIVE] qdrant_candidates=%d catalog_candidates=%d supplemental=%d",
+            len(results),
+            len(candidate_catalogs) + len(supplemental_catalog_points),
+            len(supplemental_catalog_points),
+        )
+    elif program_duration_query:
+        # Duration queries are specific, so normal top-k retrieval can miss the
+        # compact curriculum summary. Scan only the small existing payload set
+        # (no vectors or model work) and add matching structured curriculum chunks.
+        scroll_points, next_offset = client.scroll(
+            collection_name=TEXT_COLLECTION,
+            limit=256,
+            with_payload=True,
+            with_vectors=False,
+        )
+        all_points = list(scroll_points)
+        while next_offset is not None:
+            scroll_points, next_offset = client.scroll(
+                collection_name=TEXT_COLLECTION,
+                limit=256,
+                offset=next_offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not scroll_points:
+                break
+            all_points.extend(scroll_points)
+
+        seen_ids = {str(getattr(point, "id", "")) for point in results}
+        supplemental_catalog_points = [
+            point for point in all_points
+            if str(getattr(point, "id", "")) not in seen_ids
+            and program_duration_catalog_bonus(
+                question,
+                str((point.payload or {}).get("content", "")),
+            ) > 0
+        ]
+        supplemental_catalog_ids = {
+            str(getattr(point, "id", "")) for point in supplemental_catalog_points
+        }
+        results.extend(supplemental_catalog_points)
+        logger.info(
+            "[RAG_PROGRAM_DURATION] qdrant_candidates=%d supplemental=%d",
+            len(results), len(supplemental_catalog_points),
+        )
 
     logger.warning(
         "[PERF] Recherche Qdrant: %.2fs",
@@ -463,7 +566,7 @@ def search_documents(
         if not content:
             continue
 
-        semantic_score = float(result.score)
+        semantic_score = float(getattr(result, "score", 0.0) or 0.0)
 
         lexical_score = keyword_score(
             question, content
@@ -481,19 +584,37 @@ def search_documents(
             question, content
         )
 
+        catalog_bonus = program_catalog_bonus(
+            question, content, exhaustive=exhaustive_program_list
+        )
+        duration_catalog_bonus = program_duration_catalog_bonus(
+            question, content
+        )
+        catalog_bonus = max(catalog_bonus, duration_catalog_bonus)
+        point_id = str(getattr(result, "id", ""))
+
         combined_score = (
             SEMANTIC_WEIGHT * semantic_score
             + LEXICAL_WEIGHT * lexical_score
             + contextual_bonus
             + extra_bonus
             + campus_bonus
+            + catalog_bonus
         )
 
         documents.append({
+            "id": point_id,
+            "chunk_index": payload.get("chunk_index"),
             "content": content,
             "source": payload.get("source", ""),
             "page": payload.get("page", 0),
-            "score": round(combined_score, 4)
+            "score": round(combined_score, 4),
+            "semantic_score": round(semantic_score, 4),
+            "lexical_score": round(lexical_score, 4),
+            "catalog_bonus": round(catalog_bonus, 4),
+            "duration_catalog_bonus": round(duration_catalog_bonus, 4),
+            "retrieval_origin": "qdrant_scroll" if point_id in supplemental_catalog_ids else "vector_search",
+            "catalog_evidence": catalog_bonus > 0,
         })
 
     documents.sort(
@@ -501,9 +622,43 @@ def search_documents(
         reverse=True
     )
 
-    selected = diversify_documents(
-        documents, limit
-    )
+    selected = diversify_documents(documents, limit)
+    if exhaustive_program_list or program_duration_query:
+        catalog_docs = [
+            document for document in documents
+            if document.get("catalog_evidence")
+            and document["score"] >= 0.20
+        ]
+        if catalog_docs and not any(item.get("catalog_evidence") for item in selected):
+            if len(selected) >= limit:
+                selected[-1] = catalog_docs[0]
+            else:
+                selected.append(catalog_docs[0])
+            selected.sort(key=lambda item: item["score"], reverse=True)
+        diagnostic_prefix = (
+            "[RAG_EXHAUSTIVE]" if exhaustive_program_list
+            else "[RAG_PROGRAM_DURATION]"
+        )
+        logger.info(
+            "%s ranked=%s selected=%s",
+            diagnostic_prefix,
+            [
+                {"rank": rank, "id": item["id"], "page": item["page"],
+                 "chunk_index": item["chunk_index"], "score": item["score"],
+                 "semantic_score": item["semantic_score"],
+                 "lexical_score": item["lexical_score"],
+                 "catalog_bonus": item["catalog_bonus"],
+                 "retrieval_origin": item["retrieval_origin"],
+                 "excerpt": item["content"][:180]}
+                for rank, item in enumerate(documents, start=1)
+            ],
+            [
+                {"id": item["id"], "page": item["page"],
+                 "chunk_index": item["chunk_index"], "score": item["score"],
+                 "retrieval_origin": item["retrieval_origin"]}
+                for item in selected
+            ],
+        )
 
     logger.warning(
         "[PERF] Classement hybride: %.2fs",

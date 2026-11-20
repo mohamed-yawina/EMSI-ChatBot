@@ -120,6 +120,28 @@ def test_relevance_filter_drops_weak_ranked_tail_and_preserves_metadata():
     assert select_relevant_documents([{"score": 0.19}], limit=4) == []
 
 
+def test_exhaustive_list_preserves_relevant_catalog_passage_below_relative_cutoff():
+    detailed_page = {"page": 16, "score": 0.90, "content": "Détails d'une filière."}
+    catalog_page = {
+        "page": 9, "chunk_index": 0, "score": 0.26,
+        "catalog_evidence": True, "content": "Structure des cursus et intitulés des filières.",
+    }
+    documents = [detailed_page, catalog_page]
+
+    assert select_relevant_documents(documents, limit=4) == [detailed_page]
+    selected = select_relevant_documents(
+        documents, limit=4, preserve_catalog_evidence=True
+    )
+    assert detailed_page in selected
+    assert catalog_page in selected
+    below_minimum = {**catalog_page, "score": 0.19}
+    assert select_relevant_documents(
+        [detailed_page, below_minimum],
+        limit=4,
+        preserve_catalog_evidence=True,
+    ) == [detailed_page]
+
+
 def test_general_program_list_is_not_evidence_for_rabat_offerings():
     general_programs = {
         "content": "L'EMSI propose plusieurs formations en génie informatique et industriel."

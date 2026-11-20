@@ -27,6 +27,15 @@ def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
+def normalize_passage(text: str) -> str:
+    """Normalize spacing while preserving any line boundaries in extracted text."""
+    normalized_lines = [
+        re.sub(r"[\t\f\v ]+", " ", line).strip()
+        for line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    ]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(normalized_lines)).strip()
+
+
 def truncate_text(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
@@ -37,11 +46,16 @@ def truncate_text(text: str, max_chars: int) -> str:
     return truncated.rstrip() + "..."
 
 
-def build_context_with_references(documents: list) -> tuple[str, dict[str, dict]]:
+def build_context_with_references(
+    documents: list,
+    *,
+    max_documents: int = MAX_DOCUMENTS,
+    max_chars_per_document: int = MAX_CHARS_PER_DOCUMENT,
+) -> tuple[str, dict[str, dict]]:
     passages = []
     references = {}
-    for doc in documents[:MAX_DOCUMENTS]:
-        content = clean_text(doc.get("content", ""))
+    for doc in documents[:max_documents]:
+        content = normalize_passage(doc.get("content", ""))
         if not content:
             continue
         source = clean_text(doc.get("source", ""))
@@ -54,7 +68,7 @@ def build_context_with_references(documents: list) -> tuple[str, dict[str, dict]
             f"[PASSAGE {reference_id}]\n"
             f"Source PDF : {source or 'métadonnée absente'}\n"
             f"Page PDF réelle : {page if page is not None else 'métadonnée absente'}\n"
-            f"Texte : {truncate_text(content, MAX_CHARS_PER_DOCUMENT)}"
+            f"Texte extrait :\n{truncate_text(content, max_chars_per_document)}"
         )
     return "\n\n".join(passages), references
 
@@ -97,7 +111,7 @@ def _has_ambiguous_timeline(documents: list) -> bool:
     return any(
         len(set(re.findall(r"\b(?:19|20)\d{2}\b", clean_text(doc.get("content", ""))))) >= 3
         and terms.search(clean_text(doc.get("content", "")))
-        for doc in documents[:MAX_DOCUMENTS]
+        for doc in documents
     )
 
 
@@ -162,6 +176,10 @@ RÈGLES STRICTES :
 17. Si une question de suivi vise un campus sans demander son histoire ni une date, rÃ©ponds aux informations documentÃ©es sur ce campus et n'ajoute pas spontanÃ©ment une annÃ©e ou un Ã©vÃ©nement historique.
 
 18. Si l'utilisateur demande quels sont les campus ou leurs noms, énumère chaque nom explicitement présent dans les passages. Un nombre total de campus ne remplace jamais la liste. Présente la liste comme celle des noms retrouvés dans les passages, sans prétendre qu'elle est exhaustive si les documents ne l'affirment pas.
+19. Pour une liste de formations, énumère les intitulés explicitement présents dans les passages. Ne présente pas les passages récupérés comme une liste complète de toute l'offre EMSI si leur exhaustivité n'est pas établie; distingue les filières des options citées séparément.
+20. Dans toute liste, écris un intitulé indépendant par puce. Ne fusionne pas plusieurs intitulés sous le nom du premier. Rattache un sigle à un intitulé uniquement si le document associe explicitement ce sigle à ce même intitulé. Une série de sigles dans une phrase de prérequis reste une information de prérequis et ne devient pas une parenthèse ni une liste d'alias du titre voisin.
+21. Sépare les noms de programmes des durées, années préparatoires, prérequis et options. N'en fais pas des intitulés de programme supplémentaires. Si l'extraction a aplati des colonnes ou si le lien entre un sigle et un titre n'est pas explicite, conserve les titres lisibles tels quels, indique cette incertitude et ne devine pas l'association.
+22. Pour une liste exhaustive, recense les titres indépendants dans tous les passages, compare-les entre eux, puis vérifie que chacun apparaît dans une puce distincte avec son jeton de référence. Si les passages ne permettent pas de confirmer l'exhaustivité, précise que la liste est limitée aux éléments explicitement retrouvés.
 
 EXEMPLE DE DISTINCTION :
 - "150 laboratoires modernes" : information sur les laboratoires.
@@ -291,14 +309,54 @@ def _campus_enumeration_answer(question: str, documents: list) -> str | None:
 
 
 def generate_answer(question: str, documents: list, history=None) -> str:
+    from app.services.unavailable_answer import (
+        is_unavailable_answer,
+        unavailable_answer,
+    )
+
     question = clean_text(question)
     if not question:
         return "Veuillez poser une question."
     if not documents:
-        return "Je n'ai pas trouvé cette information dans les documents EMSI disponibles."
-    context, references = build_context_with_references(documents)
+        return unavailable_answer(question)
+    from app.rag.ranking_policy import (
+        is_exhaustive_program_question,
+        is_program_duration_question,
+    )
+    from app.rag.program_evidence import (
+        structured_program_duration_answer,
+        structured_program_list_answer,
+    )
+    exhaustive_program_list = is_exhaustive_program_question(question)
+    program_duration_query = is_program_duration_question(question)
+    preserve_program_catalog = exhaustive_program_list or program_duration_query
+    context, references = build_context_with_references(
+        documents,
+        max_documents=8 if preserve_program_catalog else MAX_DOCUMENTS,
+        max_chars_per_document=(
+            1200 if exhaustive_program_list or program_duration_query
+            else MAX_CHARS_PER_DOCUMENT
+        ),
+    )
+    context_documents = [entry["document"] for entry in references.values()]
+    if exhaustive_program_list:
+        logger.info(
+            "[RAG_EXHAUSTIVE] groq_passages=%s",
+            [
+                {
+                    "reference": reference_id,
+                    "id": entry["document"].get("id"),
+                    "page": entry.get("page"),
+                    "chunk_index": entry["document"].get("chunk_index"),
+                    "content_sent": truncate_text(
+                        normalize_passage(entry["document"].get("content", "")), 1200
+                    ),
+                }
+                for reference_id, entry in references.items()
+            ],
+        )
     if not context:
-        return "Je n'ai pas trouvé cette information dans les documents EMSI disponibles."
+        return unavailable_answer(question)
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         raise GroqAPIError("GROQ_API_KEY n'est pas configurée.", 503)
@@ -371,17 +429,31 @@ def generate_answer(question: str, documents: list, history=None) -> str:
             raise GroqAPIError("Groq a renvoyé un contenu vide sans atteindre la limite de tokens.", 502)
         logger.info(diagnostic, *diagnostic_values)
         answer = resolve_answer_references(answer, references)
-        campus_answer = _campus_enumeration_answer(question, documents)
+        if is_unavailable_answer(answer):
+            answer = unavailable_answer(question)
+        if exhaustive_program_list:
+            structured_list = structured_program_list_answer(
+                context_documents, references
+            )
+            if structured_list is not None:
+                answer = resolve_answer_references(structured_list, references)
+        if program_duration_query:
+            structured_duration = structured_program_duration_answer(
+                question, context_documents, references
+            )
+            if structured_duration is not None:
+                answer = resolve_answer_references(structured_duration, references)
+        campus_answer = _campus_enumeration_answer(question, context_documents)
         if campus_answer is not None:
             answer = campus_answer
         has_verified_citation = bool(get_cited_documents(answer, references))
-        safe_no_info = answer == "Je n'ai pas trouvé cette information dans les documents EMSI disponibles."
+        safe_no_info = is_unavailable_answer(answer)
         if not has_verified_citation and not safe_no_info:
             answer = "Les documents consultés ne permettent pas de vérifier cette réponse (référence non vérifiée)."
         mentioned_years = set(re.findall(r"\b(?:19|20)\d{2}\b", answer))
         source_years = set(re.findall(
             r"\b(?:19|20)\d{2}\b",
-            " ".join(clean_text(doc.get("content", "")) for doc in documents[:MAX_DOCUMENTS]),
+            " ".join(clean_text(doc.get("content", "")) for doc in context_documents),
         ))
         cited_documents = get_cited_documents(answer, references)
         citations = " ".join(
@@ -392,7 +464,7 @@ def generate_answer(question: str, documents: list, history=None) -> str:
             answer = "La date indiquée dans la réponse n'est pas vérifiable dans les passages consultés. " + citations
         elif (
             mentioned_years
-            and _has_ambiguous_timeline(documents)
+            and _has_ambiguous_timeline(context_documents)
             and _has_ambiguous_year_event_claim(answer)
         ):
             answer = (
