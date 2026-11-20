@@ -7,9 +7,45 @@ from app.rag.conversation import (
 )
 
 
+_MOJIBAKE_MARKERS = re.compile(r"(?:\u00c3|\u00e2|\u00c2|\u00ef\u00ac)")
+_NON_ASCII_RUN = re.compile(r"[^\x00-\x7f]+")
+
+
+def repair_common_mojibake(value: str) -> str:
+    """Repair common UTF-8-as-Windows-1252 text corruption without guessing.
+
+    Only byte runs that decode strictly as UTF-8 and reduce known mojibake
+    markers are changed. Other Unicode text is retained byte-for-byte.
+    """
+    text = str(value or "")
+    for _ in range(2):
+        if not _MOJIBAKE_MARKERS.search(text):
+            break
+
+        def repair_run(match: re.Match[str]) -> str:
+            run = match.group(0)
+            before = len(_MOJIBAKE_MARKERS.findall(run))
+            for encoding in ("cp1252", "latin-1"):
+                try:
+                    repaired = run.encode(encoding).decode("utf-8")
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    continue
+                if repaired != run and len(_MOJIBAKE_MARKERS.findall(repaired)) < before:
+                    return repaired
+            return run
+
+        repaired_text = _NON_ASCII_RUN.sub(repair_run, text)
+        if repaired_text == text:
+            break
+        text = repaired_text
+    return text
+
+
 def is_historical_program_timeline(content: str) -> bool:
-    """Repère une annonce datée qui associe explicitement un événement à un cursus."""
-    text = unicodedata.normalize("NFKD", str(content).lower())
+    """RepÃ¨re une annonce datÃ©e qui associe explicitement un Ã©vÃ©nement Ã  un cursus."""
+    text = unicodedata.normalize(
+        "NFKD", repair_common_mojibake(str(content).lower())
+    )
     text = "".join(char for char in text if not unicodedata.combining(char))
 
     has_year = re.search(r"\b(?:19|20)\d{2}\b", text) is not None
@@ -22,8 +58,8 @@ def is_historical_program_timeline(content: str) -> bool:
 
 
 def should_apply_program_topic_bonus(question: str, content: str) -> bool:
-    """Garde le bonus des requêtes programmes sauf pour les annonces historiques."""
-    query = unicodedata.normalize("NFKD", str(question).lower())
+    """Garde le bonus des requÃªtes programmes sauf pour les annonces historiques."""
+    query = unicodedata.normalize("NFKD", repair_common_mojibake(str(question).lower()))
     query = "".join(char for char in query if not unicodedata.combining(char))
     asks_for_programs = any(
         term in query for term in ("filiere", "formation", "specialite")
@@ -35,7 +71,9 @@ def campus_list_bonus(question: str, content: str) -> float:
     """Promote a passage that names multiple campuses for a list query."""
     if not is_campus_enumeration_question(question):
         return 0.0
-    normalized_content = unicodedata.normalize("NFKD", str(content).lower())
+    normalized_content = unicodedata.normalize(
+        "NFKD", repair_common_mojibake(str(content).lower())
+    )
     normalized_content = "".join(
         char for char in normalized_content if not unicodedata.combining(char)
     )

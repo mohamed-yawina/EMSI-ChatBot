@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../models/chat_models.dart';
+import 'image_selection_service.dart';
 
 class ChatRequestException implements Exception {
   final String message;
@@ -49,21 +50,68 @@ class ChatApiService {
     required String question,
     required List<Map<String, String>> history,
     required bool includeImages,
+    String? conversationId,
+    String? accessToken,
+    String? requestId,
+    SelectedChatImage? attachment,
   }) async {
+    final persistent = conversationId != null;
+    if (persistent &&
+        (accessToken == null || accessToken.isEmpty || requestId == null)) {
+      throw const ChatRequestException(
+        'Votre session a expiré. Reconnectez-vous pour continuer.',
+      );
+    }
+    if (attachment != null && !persistent) {
+      throw const ChatRequestException(
+        'Connectez-vous pour envoyer une image au chatbot.',
+      );
+    }
+    final payload = <String, dynamic>{
+      'question': question,
+      'use_llm': true,
+      'include_images': includeImages,
+    };
+    if (persistent) {
+      payload['request_id'] = requestId;
+    } else {
+      payload['history'] = history;
+    }
+    final endpoint = persistent
+        ? '$_baseUrl/api/conversations/$conversationId/${attachment == null ? 'chat' : 'vision'}'
+        : '$_baseUrl/api/chat';
+    final headers = <String, String>{
+      'Content-Type': 'application/json; charset=utf-8',
+      if (persistent) 'Authorization': 'Bearer $accessToken',
+    };
     late final http.Response response;
     try {
-      response = await _client
-          .post(
-            Uri.parse('$_baseUrl/api/chat'),
-            headers: const {'Content-Type': 'application/json; charset=utf-8'},
-            body: jsonEncode({
-              'question': question,
-              'use_llm': true,
-              'include_images': includeImages,
-              'history': history,
-            }),
-          )
-          .timeout(const Duration(seconds: 240));
+      if (attachment == null) {
+        response = await _client
+            .post(
+              Uri.parse(endpoint),
+              headers: headers,
+              body: jsonEncode(payload),
+            )
+            .timeout(const Duration(seconds: 240));
+      } else {
+        final multipart = http.MultipartRequest('POST', Uri.parse(endpoint))
+          ..headers['Authorization'] = 'Bearer $accessToken'
+          ..fields['question'] = question
+          ..fields['request_id'] = requestId!;
+        multipart.files.add(
+          http.MultipartFile.fromBytes(
+            'image',
+            attachment.bytes,
+            filename: 'upload',
+          ),
+        );
+        final streamed = await _client
+            .send(multipart)
+            .timeout(const Duration(seconds: 90));
+        response = await http.Response.fromStream(streamed)
+            .timeout(const Duration(seconds: 30));
+      }
     } on TimeoutException {
       throw const ChatRequestException(
         'La réponse prend trop de temps. Vérifiez que FastAPI fonctionne puis réessayez.',
@@ -102,26 +150,23 @@ class ChatApiService {
       }
     }
 
-    final images = <String>[];
+    final images = <ChatImage>[];
     final rawImages = decoded['images'];
     if (rawImages is List) {
       for (final item in rawImages) {
-        final path = item is String
-            ? item
-            : item is Map
-            ? item['url']?.toString()
-            : null;
-        if (path == null || path.isEmpty) continue;
-        final uri = Uri.tryParse(path);
-        if (uri == null) continue;
-        final baseUri = Uri.parse(_baseUrl);
-        final imageUri = uri.hasScheme ? uri : baseUri.resolveUri(uri);
-        if ((imageUri.scheme == 'http' || imageUri.scheme == 'https') &&
-            imageUri.scheme == baseUri.scheme &&
-            imageUri.host == baseUri.host &&
-            imageUri.port == baseUri.port &&
-            !images.contains(imageUri.toString())) {
-          images.add(imageUri.toString());
+        final image = ChatImage.fromJson(item, baseUrl: _baseUrl);
+        final resolved = image.url;
+        if (resolved.isNotEmpty &&
+            !images.any((saved) => saved.url == resolved)) {
+          images.add(
+            ChatImage(
+              url: resolved,
+              source: image.source,
+              page: image.page,
+              caption: image.caption,
+              context: image.context,
+            ),
+          );
         }
       }
     }
@@ -134,8 +179,13 @@ class ChatApiService {
   }
 
   String _messageForStatus(int statusCode) => switch (statusCode) {
+    401 => 'Votre session a expiré. Reconnectez-vous puis réessayez.',
+    403 ||
+    404 => 'Cette conversation n’est plus accessible. Actualisez l’historique.',
     422 =>
       'La question ne peut pas être traitée. Reformulez-la puis réessayez.',
+    413 => 'L\u2019image d\u00e9passe la limite de 5 Mo.',
+    415 => 'Utilisez une image JPEG, PNG ou WebP.',
     429 || 503 =>
       'Le service est occupé pour le moment. Réessayez dans quelques instants.',
     500 || 502 =>

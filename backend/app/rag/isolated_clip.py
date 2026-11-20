@@ -1,11 +1,13 @@
 
 import json
+import logging
 import os
 import subprocess
 import sys
 
 
 CLIP_TIMEOUT = 180
+logger = logging.getLogger("emsi-chatbot.clip")
 
 
 class ClipSearchDeferred(RuntimeError):
@@ -14,7 +16,8 @@ class ClipSearchDeferred(RuntimeError):
 
 def search_images_isolated(
     question: str,
-    limit: int = 3
+    limit: int = 3,
+    mode: str = "generic",
 ):
     question = question.strip()
 
@@ -27,7 +30,8 @@ def search_images_isolated(
 
     payload = {
         "question": question,
-        "limit": max(1, min(int(limit), 10))
+        "limit": max(1, min(int(limit), 10)),
+        "mode": mode,
     }
 
     env = os.environ.copy()
@@ -74,6 +78,9 @@ def search_images_isolated(
             "Échec du processus CLIP : "
             + result.stderr[-1500:]
         )
+
+    if result.stderr.strip():
+        logger.info("Diagnostics du worker CLIP : %s", result.stderr.strip()[-6000:])
 
     try:
         response = json.loads(

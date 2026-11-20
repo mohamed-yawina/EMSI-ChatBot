@@ -1,5 +1,6 @@
 ﻿
 import logging
+import re
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
@@ -7,10 +8,12 @@ from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 import time
 from dotenv import load_dotenv
+from app.api.auth import router as auth_router
+from app.api.conversations import router as conversations_router
 
 
 # =====================================================
@@ -25,6 +28,8 @@ app = FastAPI(
     title="EMSI-ChatBot API",
     version="1.1.0"
 )
+app.include_router(auth_router, prefix="/api")
+app.include_router(conversations_router, prefix="/api")
 
 # Un seul traitement lourd à la fois.
 rag_lock = Lock()
@@ -40,20 +45,27 @@ load_dotenv(PROJECT_ROOT / ".env")
 PROCESSED_DIR = (
     PROJECT_ROOT / "data" / "processed"
 )
+IMAGE_DIR = PROCESSED_DIR / "Brochure-EMSI" / "images"
 
 PROCESSED_DIR.mkdir(
     parents=True,
     exist_ok=True
 )
 
-app.mount(
-    "/images",
-    StaticFiles(
-        directory=str(PROCESSED_DIR),
-        check_dir=True
-    ),
-    name="images"
-)
+@app.get("/images/{image_path:path}", include_in_schema=False)
+def serve_brochure_image(image_path: str):
+    """Serve only indexed brochure image files, never arbitrary processed data."""
+    root = IMAGE_DIR.resolve()
+    candidate = (PROCESSED_DIR / image_path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Image not found.")
+    if candidate.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+        raise HTTPException(status_code=404, detail="Image not found.")
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Image not found.")
+    return FileResponse(candidate)
 
 
 # =====================================================
@@ -67,6 +79,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+
+@app.middleware("http")
+async def limit_vision_upload_body(request, call_next):
+    """Reject oversized declared multipart bodies before parsing/spooling them."""
+    if request.method == "POST" and request.url.path.endswith("/vision"):
+        from app.services.vision_service import max_upload_bytes
+
+        raw_length = request.headers.get("content-length")
+        if raw_length and raw_length.isdigit():
+            # Allow bounded multipart headers around the configured file limit.
+            if int(raw_length) > max_upload_bytes() + 64 * 1024:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "L'image dépasse la taille maximale autorisée."},
+                )
+    return await call_next(request)
 
 
 # =====================================================
@@ -125,6 +154,8 @@ def _compute_rag_answer(
     use_llm: bool,
     retrieval_query: str,
     history: tuple[dict[str, str], ...] = (),
+    *,
+    return_evidence: bool = False,
 ):
     from app.rag.isolated_retriever import (
         search_documents_isolated
@@ -282,6 +313,8 @@ def _compute_rag_answer(
         total_duration
     )
 
+    if return_evidence:
+        return answer, sources, selected_documents
     return answer, sources
 
 
@@ -297,8 +330,8 @@ def get_cached_rag_answer(question: str, use_llm: bool):
 # RECHERCHE D'IMAGES CLIP
 # =====================================================
 
-@lru_cache(maxsize=20)
-def get_cached_images(question: str):
+@lru_cache(maxsize=40)
+def get_cached_images(question: str, mode: str = "generic"):
     from app.rag.isolated_clip import (
         search_images_isolated
     )
@@ -307,7 +340,8 @@ def get_cached_images(question: str):
 
     return search_images_isolated(
         question,
-        limit=3
+        limit=10,
+        mode=mode,
     )
 
 
@@ -329,6 +363,11 @@ def chat(request: ChatRequest):
         requested_campus_offerings,
     )
     history = tuple(normalize_history(request.history))
+    from app.rag.image_intent import (
+        image_matches_person_evidence,
+        resolve_image_intent,
+    )
+    image_intent = resolve_image_intent(question, history)
     retrieval_query = build_retrieval_query(question, history)
     campus_offering_target = requested_campus_offerings(question, history)
     logger.info(
@@ -355,7 +394,15 @@ def chat(request: ChatRequest):
 
     try:
         # 1. Recherche textuelle + génération optionnelle Groq.
-        if history:
+        selected_documents = []
+        if request.include_images and image_intent.requested:
+            # Reuse the single text retrieval for both answer and image
+            # evidence. Image retrieval is not allowed to stand alone.
+            answer, sources, selected_documents = _compute_rag_answer(
+                question, request.use_llm, retrieval_query, history,
+                return_evidence=True,
+            )
+        elif history:
             # Stateful requests bypass the process-wide answer cache.
             answer, sources = _compute_rag_answer(
                 question, request.use_llm, retrieval_query, history
@@ -366,21 +413,99 @@ def chat(request: ChatRequest):
         # 2. Recherche visuelle CLIP.
         images = []
 
-        if request.include_images:
+        if request.include_images and image_intent.requested:
+            candidates = []
+            image_search_failed = False
             try:
                 # The CLIP launcher confirms BGE-M3 release and safe RAM first.
-                images = get_cached_images(
-                    question
+                candidates = (
+                    []
+                    if image_intent.person_target and not selected_documents
+                    else get_cached_images(image_intent.query, image_intent.mode)
+                )
+                if image_intent.person_target:
+                    images = [
+                        image for image in candidates
+                        if image_matches_person_evidence(
+                            image, selected_documents, image_intent.person_target
+                        )
+                    ][:3]
+                    if not images:
+                        answer = _person_photo_not_verified()
+                        sources = []
+                else:
+                    from app.rag.image_evidence import image_candidate_decision, select_diverse_images
+                    relevant_images = []
+                    candidate_diagnostics = []
+                    for candidate in candidates:
+                        relevant, _page_excerpt, reason = image_candidate_decision(
+                            candidate, image_intent, selected_documents
+                        )
+                        candidate_diagnostics.append({
+                            "id": candidate.get("id"),
+                            "source": candidate.get("source"),
+                            "page": candidate.get("page"),
+                            "score": round(float(candidate.get("score", 0.0)), 4),
+                            "visual_margin": candidate.get("visual_margin"),
+                            "width": candidate.get("width"),
+                            "height": candidate.get("height"),
+                            "reason": reason,
+                        })
+                        if not relevant:
+                            continue
+                        image = dict(candidate)
+                        relevant_images.append(image)
+                    # The CLIP worker sorts by score and keeps one candidate
+                    # per page; retain that order and cap the UI gallery.
+                    images = select_diverse_images(relevant_images, limit=3)
+                    logger.info("CLIP décisions candidats : mode=%s, décisions=%s",
+                                image_intent.mode, candidate_diagnostics)
+
+                logger.info(
+                    "CLIP pertinence : mode=%s, candidats=%d, retenus=%d, "
+                    "scores=%s, pages=%s",
+                    image_intent.mode,
+                    len(candidates),
+                    len(images),
+                    [round(float(item.get("score", 0.0)), 3) for item in candidates[:10]],
+                    [item.get("page") for item in candidates[:10]],
                 )
 
             except Exception as exc:
+                image_search_failed = True
                 # Une erreur CLIP ne doit pas
                 # empêcher la réponse textuelle.
                 from app.rag.isolated_clip import ClipSearchDeferred
                 if isinstance(exc, ClipSearchDeferred):
                     logger.warning("Recherche CLIP différée : %s", exc)
+                    answer = _image_search_unavailable(answer)
                 else:
                     logger.exception("Recherche CLIP indisponible")
+                    answer = _image_search_unavailable(answer)
+            if (
+                image_intent.person_target
+                and not images
+                and not image_search_failed
+            ):
+                answer = _person_photo_not_verified()
+                sources = []
+            elif not images and not image_search_failed:
+                answer = _no_relevant_image_answer(image_intent.mode)
+            elif images:
+                image_sources = []
+                seen = set()
+                for image in images:
+                    identity = (str(image.get("source", "")).casefold(), str(image.get("page", "")))
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    image_sources.append({
+                        "source": image.get("source", ""),
+                        "page": image.get("page", 0),
+                        "score": image.get("score", 0.0),
+                    })
+                sources = image_sources
+                answer = _answer_for_images(image_intent.mode, images)
 
         # 3. Réponse multimodale.
         return ChatResponse(
@@ -408,6 +533,67 @@ def chat(request: ChatRequest):
 
     finally:
         rag_lock.release()
+
+
+def _person_photo_not_verified() -> str:
+    return (
+        "Je n’ai pas trouvé dans la brochure de photo explicitement associée "
+        "à cette personne."
+    )
+
+
+def _image_search_unavailable(answer: str) -> str:
+    notice = "La recherche d’images est temporairement indisponible; la réponse textuelle reste disponible."
+    return answer.rstrip() + "\n\n" + notice
+
+
+def _no_relevant_image_answer(mode: str) -> str:
+    if mode == "campus":
+        return "Je n’ai pas retrouvé d’image suffisamment pertinente d’un campus EMSI dans les images indexées de la brochure."
+    if mode == "laboratory":
+        return "Je n’ai pas retrouvé d’image suffisamment pertinente d’un laboratoire EMSI dans les images indexées de la brochure."
+    if mode == "event":
+        return "Je n’ai pas retrouvé d’image suffisamment pertinente de cet événement dans les images indexées de la brochure."
+    return "Je n’ai pas retrouvé d’image suffisamment pertinente dans les images indexées de la brochure EMSI."
+
+
+def _answer_for_images(mode: str, images: list[dict]) -> str:
+    pages = ", ".join(str(image.get("page", "?")) for image in images)
+    if mode == "campus":
+        captions = [
+            str(image.get("caption", ""))
+            for image in images
+            if image.get("caption_verified") is True
+            and re.search(r"\b(campus|site|b[aâ]timent)\b", str(image.get("caption", "")), re.I)
+        ]
+        if any(re.search(r"\b(photo|photographie)\b", caption, re.I) for caption in captions):
+            return f"Voici une photo explicitement légendée comme représentant un campus EMSI (page {pages})."
+        if captions:
+            return f"La légende identifie ce visuel comme lié à un campus EMSI (page {pages})."
+        return f"J’ai trouvé un visuel de la brochure, mais aucune légende ne confirme qu’il représente un campus EMSI (page {pages})."
+    if mode == "laboratory":
+        verified_laboratory_caption = any(
+            image.get("caption_verified") is True
+            and re.search(r"\b(laboratoire|labo|travaux pratiques|atelier)\b", str(image.get("caption", "")), re.I)
+            for image in images
+        )
+        if verified_laboratory_caption:
+            return f"Voici une image explicitement légendée comme liée à un laboratoire ou à une activité pratique (pages {pages})."
+        return f"J’ai trouvé des visuels sur des pages consacrées aux activités techniques ou aux laboratoires; les images ne sont pas légendées individuellement (pages {pages})."
+    if mode == "event":
+        verified_event_caption = any(
+            image.get("caption_verified") is True
+            and re.search(r"\b(evenement|événement|conference|conférence|ceremonie|cérémonie|diplome|diplôme|forum)\b", str(image.get("caption", "")), re.I)
+            for image in images
+        )
+        if verified_event_caption:
+            return f"Voici une image légendée comme liée à l’événement demandé (pages {pages})."
+        return f"J’ai trouvé des visuels sur les pages indiquées, mais aucune légende ne permet d’identifier l’événement (pages {pages})."
+    if mode == "person":
+        return f"Voici une photo explicitement légendée et associée à la personne dans la brochure (page {pages})."
+    if mode == "brochure":
+        return f"Voici quelques visuels extraits de la brochure EMSI, avec leurs pages : {pages}."
+    return f"Voici quelques visuels pertinents de la brochure EMSI, pages {pages}."
 
 
 # =====================================================
@@ -467,6 +653,7 @@ def get_images(limit: int = 10):
             ".jpeg",
             ".webp"
         }
+        and path.stat().st_size >= 16 * 1024
     )
 
     safe_limit = max(

@@ -1,0 +1,33 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/backend \
+    HF_HOME=/home/app/.cache/huggingface \
+    OMP_NUM_THREADS=2 \
+    MKL_NUM_THREADS=2 \
+    OPENBLAS_NUM_THREADS=2 \
+    NUMEXPR_NUM_THREADS=2 \
+    TOKENIZERS_PARALLELISM=false \
+    EMSI_AI_DEVICE=cpu
+
+WORKDIR /app
+
+# Install the CPU-only PyTorch wheel so this image does not pull CUDA runtimes.
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+COPY backend/requirements.txt /app/backend/requirements.txt
+RUN python -m pip install --no-cache-dir -r /app/backend/requirements.txt
+
+RUN useradd --create-home --uid 10001 app \
+    && mkdir -p /home/app/.cache/huggingface /app/data/processed \
+    && chown -R app:app /home/app /app
+COPY --chown=app:app backend/app /app/backend/app
+COPY --chown=app:app backend/docker_healthcheck.py /app/backend/docker_healthcheck.py
+
+WORKDIR /app/backend
+USER app
+EXPOSE 8000
+
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

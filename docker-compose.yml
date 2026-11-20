@@ -1,13 +1,67 @@
-﻿services:
+services:
   qdrant:
     image: qdrant/qdrant:latest
-    container_name: emsi-qdrant
     restart: unless-stopped
     ports:
       - "127.0.0.1:6333:6333"
       - "127.0.0.1:6334:6334"
     volumes:
       - qdrant_storage:/qdrant/storage
+    mem_limit: ${QDRANT_MEMORY_LIMIT:-2g}
+    cpus: ${QDRANT_CPUS:-2.0}
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      EMSI_QDRANT_URL: http://qdrant:6333
+      EMSI_AI_DEVICE: cpu
+      HF_HOME: /home/app/.cache/huggingface
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "2"
+      NUMEXPR_NUM_THREADS: "2"
+      TOKENIZERS_PARALLELISM: "false"
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data/processed:/app/data/processed:ro
+      - huggingface_cache:/home/app/.cache/huggingface
+    depends_on:
+      qdrant:
+        condition: service_started
+    mem_limit: ${BACKEND_MEMORY_LIMIT:-7g}
+    cpus: ${BACKEND_CPUS:-4.0}
+    healthcheck:
+      test: ["CMD", "python", "-m", "docker_healthcheck"]
+      interval: 15s
+      timeout: 5s
+      start_period: 90s
+      retries: 8
+
+  flutter_web:
+    build:
+      context: ./mobile
+      dockerfile: Dockerfile
+      args:
+        API_BASE_URL: ${FLUTTER_API_BASE_URL:-http://localhost:8000}
+        SUPABASE_URL: ${SUPABASE_URL:-}
+        SUPABASE_PUBLISHABLE_KEY: ${SUPABASE_PUBLISHABLE_KEY:-}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    mem_limit: 256m
+    cpus: 1.0
 
 volumes:
+  # Keep the old Compose volume identity so an existing local database is reused.
   qdrant_storage:
+    name: ${QDRANT_VOLUME_NAME:-emsi-chatbot_qdrant_storage}
+  huggingface_cache:

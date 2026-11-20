@@ -12,6 +12,7 @@ import time
 
 from app.rag.ranking_policy import (
     campus_list_bonus,
+    repair_common_mojibake,
     should_apply_program_topic_bonus,
 )
 
@@ -138,9 +139,10 @@ def get_compute_device() -> str:
 # =====================================================
 
 def normalize_text(text: str) -> str:
+    text = repair_common_mojibake(str(text))
     text = unicodedata.normalize(
         "NFKD",
-        str(text).lower()
+        text.lower()
     )
 
     return "".join(
@@ -454,8 +456,8 @@ def search_documents(
 
     for result in results:
         payload = result.payload or {}
-        content = str(
-            payload.get("content", "")
+        content = repair_common_mojibake(
+            str(payload.get("content", ""))
         ).strip()
 
         if not content:

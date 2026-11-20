@@ -1,5 +1,6 @@
 
 import json
+import os
 import sys
 
 import torch
@@ -12,18 +13,53 @@ from app.rag.image_utils import build_image_result
 # CONFIGURATION
 # =====================================================
 
-QDRANT_URL = "http://127.0.0.1:6333"
+QDRANT_URL = os.getenv("EMSI_QDRANT_URL", "http://127.0.0.1:6333")
 IMAGE_COLLECTION = "emsi_images"
 CLIP_MODEL = "openai/clip-vit-base-patch32"
 
 MAX_CPU_THREADS = 2
 MAX_RESULTS = 10
+MAX_CONTRAST_CANDIDATES = 200
+LAST_DIAGNOSTICS = []
+
+NEGATIVE_PROMPTS = {
+    "generic": (
+        "a decorative infographic, logo, or abstract brochure graphic",
+        "a text-only page or typography without a documentary visual",
+    ),
+    "campus": (
+        "a graduation ceremony with people wearing caps and gowns",
+        "a decorative infographic, logo, or abstract brochure graphic",
+    ),
+    "laboratory": (
+        "a graduation ceremony with people wearing caps and gowns",
+        "the exterior of a university campus building",
+        "a decorative infographic, logo, or abstract brochure graphic",
+    ),
+    "event": (
+        "the exterior of a university campus building",
+        "a university research laboratory with scientific equipment",
+        "a decorative infographic, logo, or abstract brochure graphic",
+    ),
+}
+
+
+def _mode_prompt(question, mode):
+    if mode == "campus":
+        return "A real documentary photograph of an EMSI university campus building or campus grounds. " + question
+    if mode == "laboratory":
+        return "A real documentary photograph of an EMSI teaching or research laboratory with equipment. " + question
+    if mode == "event":
+        return "A real documentary photograph of the specific EMSI academic event requested. " + question
+    if mode == "brochure":
+        return "A representative non-decorative photograph or substantive illustration extracted from the EMSI brochure."
+    return question
 
 # =====================================================
 # ENCODAGE DE LA QUESTION AVEC CLIP
 # =====================================================
 
-def encode_question(question, device):
+def encode_questions(questions, device):
     torch.set_num_threads(MAX_CPU_THREADS)
 
     try:
@@ -54,7 +90,7 @@ def encode_question(question, device):
         model.eval()
 
         inputs = processor(
-            text=[question],
+            text=questions,
             return_tensors="pt",
             padding=True,
             truncation=True
@@ -82,16 +118,9 @@ def encode_question(question, device):
                         "Format de sortie CLIP non reconnu."
                     )
 
-            vector = features[0].float()
-
-            vector = vector / vector.norm().clamp(
-                min=1e-12
-            )
-
-            # Qdrant attend une liste Python.
-            image_vector = vector.cpu().tolist()
-
-        return image_vector
+            features = features.float()
+            features = features / features.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+            return [row.cpu().tolist() for row in features]
 
     except torch.cuda.OutOfMemoryError as exc:
         raise RuntimeError(
@@ -100,7 +129,7 @@ def encode_question(question, device):
         ) from exc
 
     finally:
-        del vector, features, inputs, model
+        del features, inputs, model
 
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -110,7 +139,9 @@ def encode_question(question, device):
 # RECHERCHE DES IMAGES DANS QDRANT
 # =====================================================
 
-def search_images(question, limit=3):
+def search_images(question, limit=3, mode="generic"):
+    global LAST_DIAGNOSTICS
+    LAST_DIAGNOSTICS = []
     question = str(question).strip()
 
     if not question:
@@ -121,11 +152,10 @@ def search_images(question, limit=3):
     # API image searches are deliberately CPU-only for memory stability.
     device = "cpu"
 
-    # 1. Encoder la question sur GPU ou CPU.
-    image_vector = encode_question(
-        question,
-        device
-    )
+    positive_prompt = _mode_prompt(question, mode)
+    negative_prompts = NEGATIVE_PROMPTS.get(mode, ())
+    query_prompts = [positive_prompt, *negative_prompts]
+    query_vectors = encode_questions(query_prompts, device)
 
     # 2. Rechercher les images similaires.
     client = QdrantClient(
@@ -133,21 +163,38 @@ def search_images(question, limit=3):
         timeout=20
     )
 
-    candidate_limit = min(
-        30,
-        max(limit * 5, 10)
+    candidate_limit = (
+        MAX_CONTRAST_CANDIDATES
+        if mode == "brochure"
+        else min(60, max(limit * 8, 20))
     )
 
     results = client.query_points(
         collection_name=IMAGE_COLLECTION,
-        query=image_vector,
+        query=query_vectors[0],
         limit=candidate_limit,
         with_payload=True
     ).points
 
+    # Contrastive scores compare the requested visual category with likely
+    # confounders. Querying the small image collection does not re-encode or
+    # alter its vectors; it only scores existing points.
+    negative_scores = {}
+    for vector in query_vectors[1:]:
+        points = client.query_points(
+            collection_name=IMAGE_COLLECTION,
+            query=vector,
+            limit=MAX_CONTRAST_CANDIDATES,
+            with_payload=False,
+        ).points
+        for point in points:
+            negative_scores.setdefault(str(point.id), []).append(float(point.score))
+
     # 3. Préparer les résultats pour Flutter.
     images = []
     used_urls = set()
+    used_pages = set()
+    diagnostics = LAST_DIAGNOSTICS
 
     for result in results:
         payload = result.payload or {}
@@ -158,17 +205,52 @@ def search_images(question, limit=3):
             result.id,
         )
         if not image:
+            diagnostics.append({
+                "id": str(result.id),
+                "page": (result.payload or {}).get("page"),
+                "score": round(float(result.score), 4),
+                "decision": "rejected_asset_quality_or_metadata",
+            })
             continue
+        page_key = str(image.get("page"))
+        if page_key in used_pages:
+            diagnostics.append({
+                "id": str(result.id), "page": page_key,
+                "score": round(float(result.score), 4),
+                "decision": "rejected_duplicate_page",
+            })
+            continue
+
+        image_id = str(result.id)
+        if negative_prompts:
+            scores = negative_scores.get(image_id)
+            # Missing contrast scores mean the visual class was not verified.
+            if not scores or len(scores) != len(negative_prompts):
+                diagnostics.append({
+                    "id": image_id, "page": image.get("page"),
+                    "score": round(float(result.score), 4),
+                    "decision": "rejected_contrast_scores_missing",
+                })
+                continue
+            image["visual_margin"] = round(float(result.score) - max(scores), 4)
+            diagnostics.append({
+                "id": image_id, "page": image.get("page"),
+                "score": image["score"], "visual_margin": image["visual_margin"],
+                "decision": "passed_to_page_evidence_filter",
+            })
 
         image_url = image["url"]
         if image_url in used_urls:
             continue
 
         used_urls.add(image_url)
+        used_pages.add(page_key)
 
         images.append(image)
 
-        if len(images) >= limit:
+        # Keep image galleries diverse and avoid showing several crops from a
+        # single brochure page as if they were separate subjects.
+        if len(used_pages) >= limit:
             break
 
     return images
@@ -191,11 +273,21 @@ def main():
         limit = request.get(
             "limit", 3
         )
+        mode = request.get("mode", "generic")
 
         images = search_images(
             question,
-            limit
+            limit,
+            mode,
         )
+
+        if LAST_DIAGNOSTICS:
+            print(
+                "CLIP candidats (score/marge/decision): "
+                + json.dumps(LAST_DIAGNOSTICS[:60], ensure_ascii=False),
+                file=sys.stderr,
+                flush=True,
+            )
 
         # Important :
         # stdout doit contenir uniquement du JSON.

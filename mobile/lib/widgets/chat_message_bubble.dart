@@ -81,7 +81,7 @@ class ChatMessageBubble extends StatelessWidget {
                       MarkdownContent(data: message.text, color: foreground),
                       if (message.images.isNotEmpty) ...[
                         const SizedBox(height: 14),
-                        ImageGallery(imageUrls: message.images),
+                        ImageGallery(images: message.images),
                       ],
                       if (message.sources.isNotEmpty) ...[
                         const SizedBox(height: 15),
@@ -89,7 +89,9 @@ class ChatMessageBubble extends StatelessWidget {
                       ],
                       if (!isUser) ...[
                         const SizedBox(height: 9),
-                        Row(
+                        Wrap(
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          spacing: 8,
                           children: [
                             Text(
                               _formatTime(message.createdAt),
@@ -97,7 +99,6 @@ class ChatMessageBubble extends StatelessWidget {
                                 color: colors.onSurfaceVariant,
                               ),
                             ),
-                            const SizedBox(width: 8),
                             IconButton(
                               tooltip: 'Copier la réponse',
                               visualDensity: VisualDensity.compact,
@@ -110,7 +111,6 @@ class ChatMessageBubble extends StatelessWidget {
                               ),
                             ),
                             if (isError && onRetry != null) ...[
-                              const SizedBox(width: 4),
                               TextButton.icon(
                                 onPressed: onRetry,
                                 icon: const Icon(
@@ -223,39 +223,95 @@ class SourceReferences extends StatelessWidget {
   }
 }
 
-class ImageGallery extends StatelessWidget {
-  const ImageGallery({super.key, required this.imageUrls});
+class ImageGallery extends StatefulWidget {
+  const ImageGallery({super.key, required this.images});
 
-  final List<String> imageUrls;
+  final List<ChatImage> images;
 
   @override
-  Widget build(BuildContext context) => SizedBox(
-    height: 150,
-    child: ListView.separated(
-      scrollDirection: Axis.horizontal,
-      itemCount: imageUrls.length,
-      separatorBuilder: (_, _) => const SizedBox(width: 10),
-      itemBuilder: (context, index) => ClipRRect(
-        borderRadius: BorderRadius.circular(14),
-        child: Image.network(
-          imageUrls[index],
-          width: 195,
-          height: 150,
-          fit: BoxFit.cover,
-          errorBuilder: (context, error, stackTrace) => Container(
+  State<ImageGallery> createState() => _ImageGalleryState();
+}
+
+class _ImageGalleryState extends State<ImageGallery> {
+  final Set<String> _failed = {};
+
+  @override
+  Widget build(BuildContext context) {
+    final available = widget.images
+        .where((image) => !_failed.contains(image.url))
+        .toList();
+    if (available.isEmpty) {
+      return Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surfaceContainerLow,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.image_not_supported_outlined, size: 18),
+            SizedBox(width: 8),
+            Flexible(
+              child: Text(
+                'Les images de la brochure ne sont pas accessibles pour le moment.',
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+    return SizedBox(
+      height: 184,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: available.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 10),
+        itemBuilder: (context, index) {
+          final image = available[index];
+          return SizedBox(
             width: 195,
-            color: Theme.of(context).colorScheme.surfaceContainerLow,
-            child: const Column(
-              mainAxisAlignment: MainAxisAlignment.center,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Icon(Icons.image_not_supported_outlined),
-                SizedBox(height: 6),
-                Text('Image indisponible'),
+                Expanded(
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(14),
+                    child: image.bytes != null
+                        ? Image.memory(
+                            image.bytes!,
+                            width: 195,
+                            fit: BoxFit.cover,
+                            errorBuilder: (context, error, stackTrace) =>
+                                const Icon(Icons.broken_image_outlined),
+                          )
+                        : Image.network(
+                            image.url,
+                            width: 195,
+                            fit: BoxFit.cover,
+                            errorBuilder: (context, error, stackTrace) {
+                              WidgetsBinding.instance.addPostFrameCallback((_) {
+                                if (mounted) {
+                                  setState(() => _failed.add(image.url));
+                                }
+                              });
+                              return const SizedBox.shrink();
+                            },
+                          ),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  image.displayLabel,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.labelSmall,
+                ),
               ],
             ),
-          ),
-        ),
+          );
+        },
       ),
-    ),
-  );
+    );
+  }
 }

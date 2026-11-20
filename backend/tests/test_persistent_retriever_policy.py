@@ -2,6 +2,7 @@ import os
 import sys
 import types
 import unittest
+from io import StringIO
 from unittest.mock import Mock, patch
 
 from app.rag import isolated_retriever
@@ -20,6 +21,24 @@ class PersistentRetrieverPolicyTests(unittest.TestCase):
         self.assertTrue(should_use_persistent(4096))
         self.assertFalse(should_use_persistent(4095))
         self.assertFalse(should_use_persistent(None))
+
+    def test_linux_ram_detection_respects_cgroup_limit_and_host_available(self):
+        values = {
+            "/sys/fs/cgroup/memory.max": str(8 * 1024**3),
+            "/sys/fs/cgroup/memory.current": str(3 * 1024**3),
+            "/proc/meminfo": f"MemAvailable: {7 * 1024**2} kB\n",
+        }
+
+        def fake_open(path, *args, **kwargs):
+            if path not in values:
+                raise FileNotFoundError(path)
+            return StringIO(values[path])
+
+        with (
+            patch.object(isolated_retriever.os, "name", "posix"),
+            patch("builtins.open", side_effect=fake_open),
+        ):
+            self.assertEqual(isolated_retriever._available_ram_mb(), 5 * 1024)
 
     def test_cpu_override_is_restored(self):
         original = os.environ.get("EMSI_AI_DEVICE")

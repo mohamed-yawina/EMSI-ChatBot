@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+!.env.example
+**/.venv
+**/venv
+**/__pycache__
+**/.pytest_cache
+**/.dart_tool
+**/build
+**/.gradle
+**/.cache
+data
+qdrant_storage
+qdrant_data
+*.log

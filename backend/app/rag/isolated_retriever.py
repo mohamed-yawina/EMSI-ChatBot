@@ -187,9 +187,44 @@ def should_use_persistent(available_ram_mb, minimum_ram_mb=PERSISTENT_MIN_RAM_MB
 
 
 def _available_ram_mb():
-    """Mémoire physique disponible via l'API Windows, sans dépendance tierce."""
+    """Return safe available memory on Windows and Linux containers.
+
+    Linux uses the effective cgroup limit (when configured), bounded by host
+    MemAvailable. Unknown limits are ignored instead of interpreted as free RAM.
+    """
     if os.name != "nt":
-        return None
+        candidates = []
+
+        def read_integer(path):
+            try:
+                with open(path, encoding="ascii") as source:
+                    value = source.read().strip()
+                return int(value) if value and value != "max" else None
+            except (OSError, ValueError):
+                return None
+
+        # cgroup v2, used by current Docker Desktop Linux containers.
+        limit = read_integer("/sys/fs/cgroup/memory.max")
+        current = read_integer("/sys/fs/cgroup/memory.current")
+        if limit is not None and current is not None and limit < (1 << 60):
+            candidates.append(max(0, limit - current) // (1024 * 1024))
+
+        # cgroup v1 fallback.
+        limit = read_integer("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        current = read_integer("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        if limit is not None and current is not None and limit < (1 << 60):
+            candidates.append(max(0, limit - current) // (1024 * 1024))
+
+        try:
+            with open("/proc/meminfo", encoding="ascii") as meminfo:
+                for line in meminfo:
+                    if line.startswith("MemAvailable:"):
+                        candidates.append(int(line.split()[1]) // 1024)
+                        break
+        except (OSError, ValueError, IndexError):
+            pass
+
+        return min(candidates) if candidates else None
 
     class MEMORYSTATUSEX(ctypes.Structure):
         _fields_ = [

@@ -49,12 +49,29 @@ desktop.ini
 **/.cache/huggingface/
 **/huggingface/hub/
 **/.cache/torch/
+**/models--*/
+/.model_cache/
+/models/
 
 # Local Qdrant storage
 qdrant_storage/
 qdrant_data/
 **/qdrant_storage/
 **/qdrant_data/
+**/snapshots/
+*.snapshot
+
+# Local Supabase CLI state, sessions, and database files
+supabase/.temp/
+supabase/.branches/
+supabase/storage/
+**/.auth/
+**/.tokens/
+*.session
+*.cookie
+*.db
+*.sqlite
+*.sqlite3
 
 # Local source corpus and generated extraction/embedding artifacts
 /data/documents/*.pdf
